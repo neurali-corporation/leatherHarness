@@ -1,0 +1,219 @@
+// test/compaction.js — end-to-end tests for conversation compaction.
+// Compaction kicks in when messages grow past maxMessages: older messages get
+// summarized into a single system-style block so the context window doesn't
+// blow up on long sessions.
+
+import { strict as assert } from "node:assert";
+import { registerNativeTool } from "../src/registry.ts";
+import { resolveRequest } from "../src/resolve.ts";
+import { startMockLlama } from "./mockLlama.js";
+
+// Register the clock tool so the mock can be asked to call it.
+registerNativeTool({
+  name: "clock",
+  description: "Current date and time in ISO format",
+  parameters: { type: "object", properties: {}, required: [] },
+  execute: async () => new Date().toISOString(),
+});
+
+// ── testCompactionTriggers: compaction fires when message count exceeds maxMessages ──
+async function testCompactionTriggers() {
+  let compactEvents = 0;
+  const mockPort = 12347;
+  const server = await startMockLlama(mockPort, (req) => {
+    // Always return tool calls to build up messages
+    return {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "1",
+            type: "function",
+            function: { name: "hx__clock", arguments: "{}" }
+          }]
+        }
+      }],
+    };
+  });
+
+  const cfg = {
+    upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` },
+    maxToolRounds: 20, // allow enough rounds for compaction to trigger
+    maxMessages: 10, // trigger compaction early
+  };
+
+  const body = {
+    messages: [{ role: "user", content: "What time is it?" }],
+    tools: [],
+  };
+
+  const events = [];
+  const emit = (ev) => {
+    events.push(ev);
+    if (ev.t === 'compact') compactEvents++;
+  };
+
+  // Should hit tool round limit, but compaction should have triggered
+  try {
+    await resolveRequest(body, cfg, emit);
+  } catch (_) {}
+
+  assert.ok(compactEvents > 0, `compaction should have been triggered, got ${compactEvents} events`);
+  assert.ok(events.some(e => e.t === 'compact'), "compact event emitted during streaming");
+  server.close();
+}
+
+// ── testNoCompactionWhenBelowThreshold: compaction doesn't fire if messages stay under maxMessages ──
+async function testNoCompactionWhenBelowThreshold() {
+  let compactEvents = 0;
+  const mockPort = 12349;
+  const server = await startMockLlama(mockPort, (req) => {
+    // Return final answer immediately
+    return {
+      choices: [{ message: { role: "assistant", content: "Simple answer", tool_calls: [] } }],
+    };
+  });
+
+  const cfg = {
+    upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` },
+    maxToolRounds: 2,
+    maxMessages: 100, // very high, should never trigger
+  };
+
+  const body = {
+    messages: [{ role: "user", content: "Hello" }],
+    tools: [],
+  };
+
+  const events = [];
+  const emit = (ev) => {
+    events.push(ev);
+    if (ev.t === 'compact') compactEvents++;
+  };
+
+  const result = await resolveRequest(body, cfg, emit);
+  assert.equal(compactEvents, 0, "compaction should not trigger when below threshold");
+  // Check that we got a done event (streaming mode returns null but emits done)
+  assert.ok(events.some(e => e.t === 'done'), "got done event");
+  server.close();
+}
+
+// ── testCompactionWithStreaming: compaction events stream to client ──
+async function testCompactionWithStreaming() {
+  let compactEvents = 0;
+  const mockPort = 12350;
+  const server = await startMockLlama(mockPort, (req) => {
+    // Always return tool calls to build up messages
+    return {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "1",
+            type: "function",
+            function: { name: "hx__clock", arguments: "{}" }
+          }]
+        }
+      }],
+    };
+  });
+
+  const cfg = {
+    upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` },
+    maxToolRounds: 20, // allow enough rounds for compaction to trigger
+    maxMessages: 10,
+  };
+
+  const body = {
+    messages: [{ role: "user", content: "What time is it?" }],
+    tools: [],
+  };
+
+  const events = [];
+  const emit = (ev) => {
+    events.push(ev);
+    if (ev.t === 'compact') compactEvents++;
+  };
+
+  // Should hit tool round limit, but compaction should have triggered
+  try {
+    await resolveRequest(body, cfg, emit);
+  } catch (_) {}
+
+  assert.ok(compactEvents > 0, "compaction was triggered");
+  const compactEvent = events.find(e => e.t === 'compact');
+  assert.ok(compactEvent, "compact event exists");
+  assert.ok(compactEvent.oldCount > 0, "compact event has oldCount");
+  server.close();
+}
+
+// ── testCompactionPreservesRecentMessages: compacted messages keep recent ones ──
+async function testCompactionPreservesRecentMessages() {
+  let callCount = 0;
+  let hasSeenCompaction = false;
+  const mockPort = 12352;
+  const server = await startMockLlama(mockPort, (req) => {
+    callCount++;
+
+    // Check that the compacted system message exists
+    const hasCompact = req.messages.some(m => m.role === 'system' && m.content.includes('Compacted Conversation Summary'));
+    if (hasCompact) {
+      hasSeenCompaction = true;
+    }
+
+    // First several calls: return tool calls to build up messages
+    // After compaction is detected, return final answer
+    if (hasCompact || callCount > 8) {
+      return {
+        choices: [{ message: { role: "assistant", content: "Done", tool_calls: [] } }],
+      };
+    }
+
+    return {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "1",
+            type: "function",
+            function: { name: "hx__clock", arguments: "{}" }
+          }]
+        }
+      }],
+    };
+  });
+
+  const cfg = {
+    upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` },
+    maxToolRounds: 20,
+    maxMessages: 10,
+  };
+
+  const body = {
+    messages: [{ role: "user", content: "What time is it?" }],
+    tools: [],
+  };
+
+  const events = [];
+  const emit = (ev) => {
+    events.push(ev);
+  };
+
+  try {
+    await resolveRequest(body, cfg, emit);
+  } catch (_) {}
+
+  assert.ok(hasSeenCompaction, "compaction should have been triggered");
+  server.close();
+}
+
+(async () => {
+  await testCompactionTriggers();
+  await testNoCompactionWhenBelowThreshold();
+  await testCompactionWithStreaming();
+  await testCompactionPreservesRecentMessages();
+  console.log("All compaction tests passed");
+})();

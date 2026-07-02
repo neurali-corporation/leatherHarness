@@ -1,0 +1,31 @@
+{
+  "name": "leatherHarness",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/server.ts",
+  "scripts": {
+    "build-ui": "vite build",
+    "test": "node test/run.js && node test/e2e_music.js && node test/e2e_ui.js && node test/e2e_chat.js",
+    "start": "npm run build-ui && ts-node src/server.ts",
+    "dev": "npm run build-ui && concurrently \"vite build --watch\" \"nodemon --exec ts-node src/server.ts\""
+  },
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "marked": "^12.0.0",
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.45.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.1.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0"
+  }
+}
