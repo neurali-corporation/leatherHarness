@@ -8,6 +8,7 @@ import { resolveRequest } from './resolve.ts';
 import { matchRoute } from './http-registry.ts';
 import { setListen, noteHost } from './runtime.ts';
 import { uiIconList, runUiIcon } from './ui-registry.ts';
+import { initModelLauncher, resetModelLauncher } from './model-launcher.ts';
 
 // Global stats tracking
 const globalStats = {
@@ -44,6 +45,32 @@ async function main() {
   });
   const config = JSON.parse(cfgData);
   await loadMcpServers(config.mcpServers ?? {});
+
+  // Initialize model launcher if enabled
+  if (config.enableModelLauncher) {
+    let models = config.models || [];
+    
+    // If no models configured, auto-discover from launchers directory
+    if (models.length === 0) {
+      const launchersDir = config.launchersDir || resolvePath(process.cwd(), '..', 'launchers');
+      console.log(`Auto-discovering models from: ${launchersDir}`);
+      const { autoDiscoverModels } = await import('./model-launcher.ts');
+      models = await autoDiscoverModels(launchersDir);
+      console.log(`Found ${models.length} models`);
+    }
+    
+    initModelLauncher({
+      enableModelLauncher: config.enableModelLauncher,
+      models,
+    });
+    console.log('Model launcher initialized');
+
+    // Start the default model at boot. startModel only spawns the process
+    // (it doesn't wait for the model to finish loading), so this returns
+    // promptly and doesn't delay the HTTP server coming up.
+    const { getModelLauncher } = await import('./model-launcher.ts');
+    await getModelLauncher()?.autoStart();
+  }
 
   const server = http.createServer(async (req, res) => {
     // Remember the address the browser reaches us at, so tool links use it.
@@ -122,7 +149,7 @@ async function main() {
         // final answer). Folding every snapshot into the global stats double-,
         // triple-, … counts the same tokens and calls. Instead keep the latest
         // snapshot and apply it to the global stats exactly once, when the
-        // request finishes ('done').
+        // request finishes ('done'). This bookkeeping runs for both wire formats.
         let lastMetrics: any = null;
         let globalApplied = false;
         const applyGlobalOnce = () => {
@@ -130,27 +157,84 @@ async function main() {
           updateGlobalMetrics(lastMetrics);
           globalApplied = true;
         };
-        const safeEmit = (ev: object) => {
-          const e = ev as any;
-          if (e.t === 'metrics') {
-            lastMetrics = e;
-          } else if (e.t === 'done') {
-            applyGlobalOnce();
-          }
-          // Only write if the response is still writable (client hasn't disconnected)
+        const trackMetrics = (e: any) => {
+          if (e.t === 'metrics') lastMetrics = e;
+          else if (e.t === 'done') applyGlobalOnce();
+        };
+
+        // The web UI (identified by the X-Leather-UI header) understands our rich
+        // internal event stream. Every other caller is a standard OpenAI client
+        // (e.g. opencode), which needs `chat.completion.chunk`s — so translate.
+        const isUi = req.headers['x-leather-ui'] === '1';
+
+        // UI format: pass the internal {t:...} events straight through.
+        const uiEmit = (ev: object) => {
+          trackMetrics(ev as any);
           if (!res.writableEnded && res.writable) {
             res.write(`data: ${JSON.stringify(ev)}\n\n`);
           }
         };
+
+        // OpenAI format: translate internal events into chat.completion.chunks.
+        const streamId = 'chatcmpl-' + Math.random().toString(36).slice(2);
+        const created = Math.floor(Date.now() / 1000);
+        const model = json.model ?? 'leatherharness';
+        let finishReason = 'stop';
+        const writeChunk = (delta: object, finish: string | null) => {
+          if (res.writableEnded || !res.writable) return;
+          const chunk = {
+            id: streamId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta, finish_reason: finish }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        };
+        const openaiEmit = (ev: object) => {
+          const e = ev as any;
+          trackMetrics(e);
+          switch (e.t) {
+            case 'delta':
+              // resolveRequest emits the full assistant content once per answer.
+              if (e.text) writeChunk({ content: e.text }, null);
+              break;
+            case 'tool_calls': {
+              const calls = (e.calls ?? []).map((c: any, i: number) => ({
+                index: i,
+                id: c.id,
+                type: 'function',
+                function: { name: c.function?.name, arguments: c.function?.arguments ?? '' },
+              }));
+              if (calls.length) {
+                writeChunk({ tool_calls: calls }, null);
+                finishReason = 'tool_calls';
+              }
+              break;
+            }
+            case 'error':
+              if (!res.writableEnded && res.writable) {
+                res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`);
+              }
+              break;
+            case 'done':
+              writeChunk({}, finishReason);
+              break;
+            // reasoning / tool_call / tool_result / metrics / compact are
+            // harness-internal observability — suppressed for external clients.
+          }
+        };
+
+        const emitFn = isUi ? uiEmit : openaiEmit;
         try {
-          await resolveRequest(json, config, safeEmit);
+          await resolveRequest(json, config, emitFn);
         } catch (e: any) {
           console.error('❌ resolveRequest error:', e);
           // Only emit error/done if response is still open
           if (!res.writableEnded && res.writable) {
-            safeEmit({ t: 'error', message: e.message });
-            safeEmit({ t: 'done', usage: {} });
-            safeEmit('data: [DONE]\n\n');
+            emitFn({ t: 'error', message: e.message });
+            emitFn({ t: 'done', usage: {} });
+            res.write('data: [DONE]\n\n');
             res.end();
           }
           return;
@@ -226,6 +310,17 @@ async function main() {
 
     // Proxy upstream LLM /metrics endpoint
     if (req.method === 'GET' && pathname === '/api/upstream/metrics') {
+      // If we manage the model and none is running, there's nothing to poll —
+      // return quietly instead of hammering the port and logging ECONNREFUSED.
+      if (config.enableModelLauncher) {
+        const { getModelLauncher } = await import('./model-launcher.ts');
+        const launcher = getModelLauncher();
+        if (launcher && !launcher.getStatus().isRunning) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ running: false, error: 'No model running' }));
+          return;
+        }
+      }
       try {
         // llama.cpp --metrics exposes metrics at /metrics on the same host/port
         // Strip /v1 suffix from baseUrl if present to get the base URL
@@ -288,6 +383,98 @@ async function main() {
         console.error('❌ Upstream metrics fetch error:', e);
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `Failed to fetch upstream metrics: ${e.message}` }));
+      }
+      return;
+    }
+
+    // Model launcher routes
+    if (req.method === 'GET' && pathname === '/api/models/status') {
+      const { getModelLauncher } = await import('./model-launcher.ts');
+      const launcher = getModelLauncher();
+      if (!launcher) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ enabled: false, isRunning: false, modelName: null, pid: null, models: [] }));
+        return;
+      }
+      const status = launcher.getStatus();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(status));
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/models/list') {
+      const { getModelLauncher } = await import('./model-launcher.ts');
+      const launcher = getModelLauncher();
+      if (!launcher) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: [] }));
+        return;
+      }
+      const models = launcher.listModels();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ models }));
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/models/start') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const json = JSON.parse(body);
+      const { getModelLauncher } = await import('./model-launcher.ts');
+      const launcher = getModelLauncher();
+      if (!launcher) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Model launcher not enabled' }));
+        return;
+      }
+      try {
+        await launcher.startModel(json.modelName);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/models/stop') {
+      const { getModelLauncher } = await import('./model-launcher.ts');
+      const launcher = getModelLauncher();
+      if (!launcher) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Model launcher not enabled' }));
+        return;
+      }
+      try {
+        await launcher.stopModel();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/models/switch') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const json = JSON.parse(body);
+      const { getModelLauncher } = await import('./model-launcher.ts');
+      const launcher = getModelLauncher();
+      if (!launcher) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Model launcher not enabled' }));
+        return;
+      }
+      try {
+        await launcher.switchModel(json.modelName);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
       }
       return;
     }

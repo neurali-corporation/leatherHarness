@@ -269,6 +269,10 @@ export async function resolveRequest(body: any, config: any, emit?: Emit): Promi
       console.log('⚠️  Foreign tool calls:', foreign.map((c: any) => c.function.name));
       if (emit) {
         emit({ t: 'delta', text: content });
+        // Forward the model's tool_calls so OpenAI-compatible clients (which passed
+        // their own tools) actually receive the calls they need to execute. The web
+        // UI never sends tools, so it never reaches this branch and ignores the event.
+        emit({ t: 'tool_calls', calls });
         emitMetrics();
         emit({ t: 'done', usage: data.usage ?? {} });
         return null;

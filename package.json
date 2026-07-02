@@ -5,7 +5,7 @@
   "main": "src/server.ts",
   "scripts": {
     "build-ui": "vite build",
-    "test": "node test/run.js && node test/e2e_music.js && node test/e2e_ui.js && node test/e2e_chat.js",
+    "test": "node test/run.js && node test/e2e_music.js && node test/e2e_ui.js && node test/e2e_chat.js && node test/e2e_stream.js && node test/model-launcher.js",
     "start": "npm run build-ui && ts-node src/server.ts",
     "dev": "npm run build-ui && concurrently \"vite build --watch\" \"nodemon --exec ts-node src/server.ts\""
   },

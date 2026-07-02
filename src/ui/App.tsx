@@ -255,7 +255,7 @@ export default function App() {
     try {
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Leather-UI': '1' },
         body: JSON.stringify({ model: 'any', messages: apiMsgs, stream: true }),
         signal: controller.signal,
       });
@@ -507,6 +507,9 @@ export default function App() {
         </div>
       )}
 
+      {/* Model switcher */}
+      <ModelSwitcher />
+
       {/* Global metrics panel */}
       <GlobalMetricsPanel />
 
@@ -748,6 +751,148 @@ export default function App() {
   );
 }
 
+function ModelSwitcher() {
+  const [status, setStatus] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchStatus = async () => {
+    try {
+      const res = await fetch('/api/models/status');
+      const data = await res.json();
+      setStatus(data);
+      setError(null);
+      setLoading(false);
+    } catch (e: any) {
+      setError(e.message);
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleSwitch = async (modelName: string) => {
+    try {
+      const res = await fetch('/api/models/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelName }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        setToast(`Failed to switch model: ${data.error}`);
+        setTimeout(() => setToast(null), 3000);
+      }
+      await fetchStatus();
+    } catch (e: any) {
+      setToast(`Error switching model: ${e.message}`);
+      setTimeout(() => setToast(null), 3000);
+    }
+  };
+
+  const handleStop = async () => {
+    try {
+      const res = await fetch('/api/models/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!data.success) {
+        setToast(`Failed to stop model: ${data.error}`);
+        setTimeout(() => setToast(null), 3000);
+      }
+      await fetchStatus();
+    } catch (e: any) {
+      setToast(`Error stopping model: ${e.message}`);
+      setTimeout(() => setToast(null), 3000);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div style={{
+        flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '8px 10px',
+        fontSize: 11, color: C.muted,
+      }}>
+        <div style={{ fontWeight: 500, marginBottom: 4, color: C.text }}>Model Launcher</div>
+        <div>loading...</div>
+      </div>
+    );
+  }
+
+  if (error || !status) {
+    return null;
+  }
+
+  if (!status.enabled) {
+    return null;
+  }
+
+  return (
+    <div style={{
+      flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '8px 10px',
+      fontSize: 11, color: C.muted,
+    }}>
+      <div style={{ fontWeight: 500, marginBottom: 4, color: C.text }}>Model Launcher</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>
+            Status: <strong style={{ color: status.isRunning ? C.accent : C.danger }}>
+              {status.isRunning ? 'Running' : 'Stopped'}
+            </strong>
+          </span>
+          {status.isRunning && (
+            <button
+              onClick={handleStop}
+              style={{
+                background: 'transparent',
+                border: `1px solid ${C.danger}`,
+                color: C.danger,
+                borderRadius: 4,
+                padding: '2px 6px',
+                cursor: 'pointer',
+                fontSize: 10,
+              }}
+            >Stop</button>
+          )}
+        </div>
+        {status.isRunning && status.modelName && (
+          <div style={{ color: C.text, fontSize: 10 }}>
+            Current: {status.modelName}
+            {status.pid && <span style={{ color: C.muted, marginLeft: 4 }}>(PID: {status.pid})</span>}
+          </div>
+        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 }}>
+          {status.models.map(model => (
+            <button
+              key={model.name}
+              onClick={() => handleSwitch(model.name)}
+              disabled={status.isRunning && status.modelName === model.name}
+              style={{
+                background: status.isRunning && status.modelName === model.name ? C.accentDim : C.surface2,
+                border: `1px solid ${status.isRunning && status.modelName === model.name ? C.accentBorder : C.border}`,
+                color: status.isRunning && status.modelName === model.name ? C.accent : C.text,
+                borderRadius: 4,
+                padding: '4px 8px',
+                cursor: status.isRunning && status.modelName === model.name ? 'default' : 'pointer',
+                fontSize: 10,
+                textAlign: 'left',
+              }}
+            >
+              {model.name}
+              {model.default && <span style={{ color: C.muted, marginLeft: 4 }}>(default)</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function btnStyle(c: typeof C) {
   return {
     width: '100%' as const, padding: '8px 0' as const,
@@ -823,6 +968,14 @@ function UpstreamMetricsPanel() {
       try {
         const res = await fetch('/api/upstream/metrics');
         const text = await res.text();
+        // 503 with running:false means no model is running — a normal idle
+        // state, not an error worth surfacing.
+        if (res.status === 503) {
+          setMetrics(null);
+          setError('no model running');
+          setLoading(false);
+          return;
+        }
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}: ${text.slice(0, 100)}`);
         }

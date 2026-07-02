@@ -8,13 +8,246 @@ export interface PluginConfig<T extends object = Record<string, unknown>> {
   set(patch: Partial<T>): Promise<void>;
 }
 
+// Default llama-server launch commands written into a fresh config so the
+// model launcher works out of the box. `command` is the executable and
+// `params` its llama.cpp `llama-server` arguments — edit the -hf model/quant,
+// context, and sampling params to taste, or add your own entries.
+export const DEFAULT_MODELS = [
+  {
+    name: 'Devstral 2 (123B)',
+    command: 'llama-server',
+    params: [
+      '-hf unsloth/Devstral-2-123B-Instruct-2512-GGUF:UD-Q4_K_XL',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 65536',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 0.15',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+  {
+    name: 'MiniMax M2.5',
+    command: 'llama-server',
+    params: [
+      '-hf unsloth/MiniMax-M2.5-GGUF:UD-Q3_K_XL',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 32768',
+      '-b 2048',
+      '-ub 512',
+      '--temp 1.0',
+      '--top-p 0.95',
+      '--top-k 40',
+      '--min-p 0.01',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+  {
+    name: 'Mistral Medium 3.5',
+    command: 'llama-server',
+    params: [
+      '-hf unsloth/Mistral-Medium-3.5-128B-GGUF:UD-Q4_K_XL',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 65536',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 0.7',
+      '--chat-template-kwargs {"reasoning_effort":"high"}',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+  {
+    name: 'Ornith 1.0 35B (agentic coding, light)',
+    command: 'llama-server',
+    params: [
+      '-hf deepreinforce-ai/Ornith-1.0-35B-GGUF:Q4_K_M',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 65536',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 0.6',
+      '--top-p 0.95',
+      '--top-k 20',
+      '--min-p 0',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+  {
+    name: 'Ornith 1.0 35B (agentic coding)',
+    command: 'llama-server',
+    params: [
+      '-hf deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 262144',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 0.6',
+      '--top-p 0.95',
+      '--top-k 20',
+      '--min-p 0',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+  {
+    name: 'Qwen3.6-27B (dense, light)',
+    command: 'llama-server',
+    params: [
+      '-hf unsloth/Qwen3.6-27B-GGUF:UD-Q4_K_XL',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 65536',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 0.6',
+      '--top-p 0.95',
+      '--top-k 20',
+      '--min-p 0',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: true,
+  },
+  {
+    name: 'Qwen3.6-27B (dense)',
+    command: 'llama-server',
+    params: [
+      '-hf unsloth/Qwen3.6-27B-GGUF:UD-Q8_K_XL',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 262144',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 0.6',
+      '--top-p 0.95',
+      '--top-k 20',
+      '--min-p 0',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+  {
+    name: 'Qwen3 Coder Next (80B MoE)',
+    command: 'llama-server',
+    params: [
+      '-hf unsloth/Qwen3-Coder-Next-GGUF:UD-Q8_K_XL',
+      '--jinja',
+      '-ngl 99',
+      '-fa on',
+      '-c 65536',
+      '-b 2048',
+      '-ub 512',
+      '--cache-type-k q8_0',
+      '--cache-type-v q8_0',
+      '--temp 1.0',
+      '--top-p 0.95',
+      '--top-k 40',
+      '--min-p 0.01',
+      '--host 0.0.0.0',
+      '--port 9001',
+      '--threads 16',
+      '--threads-batch 16',
+      '--parallel 1',
+      '-dio',
+      '--cache-prompt',
+      '--metrics',
+    ],
+    default: false,
+  },
+];
+
+// Serialize the config as JSON. Each model's `params` entry bundles a flag with
+// its value ("-c 65536"), so standard 2-space formatting already puts one
+// logical argument per line.
+export function stringifyConfig(cfg: unknown): string {
+  return JSON.stringify(cfg, null, 2);
+}
+
 const BASE_CONFIG = {
-  listen:        { host: '127.0.0.1', port: 9001 },
-  upstream:      { baseUrl: '${OPENCODE_ENDPOINT:-http://127.0.0.1:8080/v1}' },
-  maxToolRounds: 25,
-  mcpServers:    {},
-  pluginsDir:    './plugins',
-  pluginConfig:  {} as Record<string, unknown>,
+  listen:             { host: '127.0.0.1', port: 8080 },
+  upstream:           { baseUrl: '${OPENCODE_ENDPOINT:-http://127.0.0.1:9001/v1}' },
+  maxToolRounds:      25,
+  mcpServers:         {},
+  pluginsDir:         './plugins',
+  enableModelLauncher: true,
+  models:             DEFAULT_MODELS,
+  pluginConfig:       {} as Record<string, unknown>,
 };
 
 function applyEnv(raw: string): string {
@@ -37,7 +270,7 @@ function makePluginConfig<T extends object>(name: string, cfgPath: string): Plug
       cfg.pluginConfig ??= {};
       cfg.pluginConfig[name] ??= {};
       Object.assign(cfg.pluginConfig[name], patch);
-      await writeFile(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
+      await writeFile(cfgPath, stringifyConfig(cfg), 'utf8');
     },
   };
 }
@@ -78,7 +311,7 @@ export async function loadPlugins(pluginsDir: string, cfgPath: string): Promise<
       } catch { /* plugin may not load without config — that's fine */ }
     }
     const cfg = { ...BASE_CONFIG, pluginConfig };
-    await writeFile(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
+    await writeFile(cfgPath, stringifyConfig(cfg), 'utf8');
     console.log('Default config.json written. Edit it then restart.');
   }
 
