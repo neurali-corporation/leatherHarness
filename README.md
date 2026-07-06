@@ -431,7 +431,7 @@ introspection.
 | `src/registry.ts` | Native tool registry. Produces OpenAI-compatible tool schemas and resolves tool names at execution time. |
 | `src/plugin-loader.ts` | Discovers `plugins/` subdirectories, calls `setup(cfg)`, and generates `config.json` defaults on first run. |
 | `src/mcp.ts` | Loads MCP server specs from config and registers a dummy tool per server. |
-| `src/model-launcher.ts` | Optional local model launcher: parses launcher scripts, starts/stops/switches the upstream model process, frees stale ports, auto-restarts on crash, and optionally survives SIGHUP (via `--survive-hup`). |
+| `src/model-launcher.ts` | Optional local model launcher: parses launcher scripts, starts/stops/switches the upstream model process, frees stale ports, auto-restarts on crash, and kills the model process when the harness shuts down. |
 | `src/http-registry.ts` | HTTP route registry for plugin-mounted endpoints (e.g. `/music`). |
 | `src/ui-registry.ts` | UI icon registry for plugin-contributed toolbar icons. |
 | `src/runtime.ts` | Shared view of the harness listen address. Plugins build absolute URLs using the observed Host header. |
@@ -501,12 +501,10 @@ When `stream: true`, leatherHarness emits typed SSE events:
   unexpectedly (backend crash, OOM, template abort), it is respawned with
   exponential backoff (1s→30s, reset after the process stays healthy >30s). A
   deliberate stop/switch/shutdown is never auto-restarted.
-- **Optionally survives terminal disconnect** — start with `--survive-hup` (or
-  `SURVIVE_HUP=1`) and the harness ignores `SIGHUP` and spawns the model detached
-  (its own process group), so a controlling-terminal / SSH disconnect takes down
-  neither the harness nor the expensive-to-reload model. Without the flag a
-  hangup terminates the harness the way Node normally does. `SIGINT`/`SIGTERM`
-  always perform a clean shutdown (killing the model process).
+- **Shuts down with the harness** — the model runs in the harness's process group,
+  and `SIGINT`/`SIGTERM`/`SIGHUP` all perform a clean shutdown that kills the model
+  process. A controlling-terminal / SSH disconnect (`SIGHUP`) takes the model down
+  along with the harness.
 
 ---
 
