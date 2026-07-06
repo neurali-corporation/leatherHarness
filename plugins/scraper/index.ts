@@ -6,7 +6,7 @@ export const defaultConfig = {};
 export function setup(_cfg: PluginConfig) {
   registerNativeTool({
     name: 'scrape',
-    description: 'Render a URL with a headless browser, following all redirects, and return the full visible text content of the page.',
+    description: 'Render a URL with a headless browser, following all redirects, and return the full HTML content of the page with <script> and <style> tags removed from the <head>.',
     parameters: {
       type: 'object',
       properties: {
@@ -39,13 +39,25 @@ export function setup(_cfg: PluginConfig) {
       try {
         const page = await browser.newPage();
         await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
-        const result = await page.evaluate(() => ({
-          url:   window.location.href,
-          title: document.title,
-          text:  document.body.innerText,
-        }));
+        const result = await page.evaluate(() => {
+          // Clone the document to avoid mutating the live DOM
+          const clone = document.cloneNode(true) as Document;
+          
+          // Remove <script> and <style> from <head>
+          const head = clone.querySelector('head');
+          if (head) {
+            head.querySelectorAll('script, style').forEach(el => el.remove());
+          }
+          
+          // Return the full HTML of the modified document
+          return {
+            url:   window.location.href,
+            title: document.title,
+            html:  clone.documentElement.outerHTML,
+          };
+        });
         const header = `URL: ${result.url}\nTitle: ${result.title}\n\n`;
-        return header + result.text;
+        return header + result.html;
       } catch (e: unknown) {
         // Return a clean, model-readable failure instead of throwing.
         return `ERROR: failed to fetch ${url}: ${describe(e)}`;
