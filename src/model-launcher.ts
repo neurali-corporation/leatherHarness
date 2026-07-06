@@ -456,13 +456,17 @@ function registerExitCleanup(): void {
     });
   }
 
-  // Deliberately survive SIGHUP: a controlling-terminal / SSH disconnect must not
+  // Optionally survive SIGHUP: a controlling-terminal / SSH disconnect must not
   // take a long-running harness down. Registering any handler overrides Node's
   // default (terminate). Combined with the detached child spawn, neither the
-  // harness nor llama-server dies when the terminal goes away.
-  process.on('SIGHUP', () => {
-    console.warn('↩️  Ignoring SIGHUP (terminal disconnect); harness stays up');
-  });
+  // harness nor llama-server dies when the terminal goes away. This is opt-in —
+  // pass --survive-hup (or SURVIVE_HUP=1) at startup — so that by default a
+  // terminal hangup still terminates the harness the way Node normally would.
+  if (process.argv.includes('--survive-hup') || process.env.SURVIVE_HUP === '1') {
+    process.on('SIGHUP', () => {
+      console.warn('↩️  Ignoring SIGHUP (terminal disconnect); harness stays up');
+    });
+  }
 }
 
 export function initModelLauncher(config: ModelLauncherConfig): void {
