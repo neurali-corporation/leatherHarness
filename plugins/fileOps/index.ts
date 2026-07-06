@@ -1,6 +1,6 @@
 import { registerNativeTool } from '../../src/registry.ts';
 import type { PluginConfig } from '../../src/plugin-loader.ts';
-import { readFile, readdir, copyFile, rename, unlink } from 'node:fs/promises';
+import { readFile, readdir, copyFile, rename, unlink, rmdir, stat } from 'node:fs/promises';
 import { resolve as resolvePath, dirname, join } from 'node:path';
 
 interface FileOpsConfig {
@@ -89,21 +89,10 @@ export async function setup(cfg: PluginConfig<FileOpsConfig>) {
     },
   });
 
-  registerNativeTool({
-    name: 'suggest_start_dir',
-    description:
-      'Provide a suggested starting directory (one of the allowed directories) for the model to begin browsing. Returns a single absolute path string.',
-    parameters: { type: 'object', properties: {}, required: [] },
-    execute: async () => {
-      const dirs = await getAllowedDirs();
-      return dirs.length ? dirs[0] : '';
-    },
-  });
-
   // List directory tree (directories only, recursive)
   registerNativeTool({
     name: 'dir_tree',
-    description: 'Recursively list all subdirectories under a given directory (no files). Returns each directory path ending with a slash.',
+    description: 'List subdirectories under a given directory as a nested JSON object. The root has a path key; subdirectories are nested as empty objects.',
     parameters: {
       type: 'object',
       properties: { dir: { type: 'string', description: 'Absolute path to start' } },
@@ -113,21 +102,24 @@ export async function setup(cfg: PluginConfig<FileOpsConfig>) {
       const allowed = await getAllowedDirs();
       if (!isPathAllowed(dir, allowed)) return 'ERROR: Access denied.';
       const base = resolvePath(process.cwd(), dir);
-      const result: string[] = [];
-      async function walk(current: string) {
-        try {
-          const entries = await readdir(current, { withFileTypes: true });
-          for (const e of entries) {
-            if (e.isDirectory()) {
-              const abs = `${current}/${e.name}`;
-              result.push(`${abs}/`);
-              await walk(abs);
-            }
-          }
-        } catch { /* ignore */ }
+      try {
+        const s = await stat(base);
+        if (!s.isDirectory()) return 'ERROR: Not a directory.';
+      } catch (e: unknown) {
+        return `ERROR: ${(e as NodeJS.ErrnoException).message}`;
       }
-      await walk(base);
-      return result.join('\n') || '(empty)';
+      async function build(current: string): Promise<Record<string, unknown>> {
+        const result: Record<string, unknown> = {};
+        const entries = await readdir(current, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.isDirectory()) {
+            result[e.name] = await build(`${current}/${e.name}`);
+          }
+        }
+        return result;
+      }
+      const tree = await build(base);
+      return JSON.stringify(tree, null, 2);
     },
   });
 
@@ -244,6 +236,27 @@ export async function setup(cfg: PluginConfig<FileOpsConfig>) {
         try {
           await unlink(abs);
           return `OK: deleted ${abs}`;
+        } catch (e: unknown) {
+          return `ERROR: ${(e as NodeJS.ErrnoException).message}`;
+        }
+      },
+    });
+
+    registerNativeTool({
+      name: 'rmdir',
+      description: 'Delete an empty directory. The path must be within the configured write directories (call list_write_dirs to see them). This is irreversible — the directory must be empty. Will fail if the directory is not empty.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Empty directory path to delete (within a write directory)' } },
+        required: ['path'],
+      },
+      execute: async ({ path }: { path: string }) => {
+        const dirs = await getWriteDirs();
+        if (!isPathAllowed(path, dirs)) return 'ERROR: Access denied.';
+        const abs = resolvePath(process.cwd(), path);
+        try {
+          await rmdir(abs);
+          return `OK: deleted directory ${abs}`;
         } catch (e: unknown) {
           return `ERROR: ${(e as NodeJS.ErrnoException).message}`;
         }
