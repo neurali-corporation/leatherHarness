@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { marked } from 'marked';
 import hljs from 'highlight.js/lib/common';
 import 'highlight.js/styles/github-dark.css';
+import { uiPlugins } from './plugin-registry';
 
 function escapeHtml(s: string): string {
   return s
@@ -96,7 +97,7 @@ export default function App() {
   const [expanded,    setExpanded]    = useState<Set<string>>(new Set());
   const [pluginIcons, setPluginIcons] = useState<{ id: string; title: string; icon: string }[]>([]);
   const [toast,       setToast]       = useState<string | null>(null);
-  const [overlayUrl,  setOverlayUrl]  = useState<string | null>(null);
+  const [openPlugin,  setOpenPlugin]  = useState<string | null>(null);
 
   // Plugins can contribute clickable icons to the UI via the ui-registry.
   useEffect(() => {
@@ -110,10 +111,10 @@ export default function App() {
     try {
       const res = await fetch(`/api/ui/icons/${encodeURIComponent(id)}`, { method: 'POST' });
       const r = await res.json();
-      if (r.overlay) setOverlayUrl(r.overlay);
       if (r.open) window.open(r.open, '_blank', 'noopener');
       if (r.navigate) window.location.href = r.navigate;
       if (r.message) { setToast(r.message); setTimeout(() => setToast(null), 3000); }
+      if (uiPlugins.some(p => p.id === id)) setOpenPlugin(id);
     } catch {
       setToast('Action failed'); setTimeout(() => setToast(null), 3000);
     }
@@ -150,16 +151,11 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // The full-screen overlay (e.g. the music player iframe) asks to close itself
-  // via postMessage; also allow Escape to dismiss it.
+  // Allow Escape to dismiss the music player.
   useEffect(() => {
-    const onMsg = (e: MessageEvent) => {
-      if (e.origin === window.location.origin && e.data === 'lh:close-overlay') setOverlayUrl(null);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOverlayUrl(null); };
-    window.addEventListener('message', onMsg);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpenPlugin(null); };
     window.addEventListener('keydown', onKey);
-    return () => { window.removeEventListener('message', onMsg); window.removeEventListener('keydown', onKey); };
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   const createSession = () => {
@@ -485,12 +481,12 @@ export default function App() {
           </div>
         ))}
       </div>
-      {pluginIcons.length > 0 && (
+      {pluginIcons.filter(p => !uiPlugins.some(u => u.id === p.id)).length > 0 && (
         <div style={{
           flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '8px 10px',
           display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center',
         }}>
-          {pluginIcons.map(p => (
+          {pluginIcons.filter(p => !uiPlugins.some(u => u.id === p.id)).map(p => (
             <button
               key={p.id}
               onClick={() => runPluginIcon(p.id)}
@@ -503,6 +499,35 @@ export default function App() {
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
               }}
             >{p.icon}</button>
+          ))}
+        </div>
+      )}
+
+      {/* UI-plugin launchers (registry-driven) */}
+      {uiPlugins.length > 0 && (
+        <div style={{ borderTop: `1px solid ${C.border}`, padding: '8px 10px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {uiPlugins.map(p => (
+            <button
+              key={p.id}
+              onClick={() => setOpenPlugin(p.id)}
+              style={{
+                width: '100%',
+                padding: '6px 0',
+                background: C.accentDim,
+                border: `1px solid ${C.accentBorder}`,
+                color: C.accent,
+                borderRadius: 7,
+                cursor: 'pointer',
+                fontSize: 13,
+                fontWeight: 500,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 6,
+              }}
+            >
+              {p.icon} {p.title}
+            </button>
           ))}
         </div>
       )}
@@ -560,27 +585,16 @@ export default function App() {
         @keyframes busy-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
       `}</style>
 
-      {overlayUrl && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 100, background: C.bg, display: 'flex', flexDirection: 'column' }}>
-          <iframe
-            src={overlayUrl}
-            title="Music player"
-            style={{ flex: 1, width: '100%', height: '100%', border: 'none' }}
-          />
-          <button
-            onClick={() => setOverlayUrl(null)}
-            title="Close (Esc)"
-            aria-label="Close"
-            style={{
-              position: 'absolute', top: 'max(10px, env(safe-area-inset-top, 10px))', right: 12, zIndex: 101,
-              width: 34, height: 34, fontSize: 18, lineHeight: 1,
-              background: C.surface2, border: `1px solid ${C.border}`, color: C.text,
-              borderRadius: 8, cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}
-          >✕</button>
-        </div>
-      )}
+      {/* Every UI plugin is mounted for the whole app lifetime and told whether
+          its window should be visible — so it can own persistent state (e.g. an
+          <audio> element that keeps playing while the window is closed). */}
+      {uiPlugins.map(p => (
+        <p.Component
+          key={p.id}
+          open={openPlugin === p.id}
+          onClose={() => setOpenPlugin(null)}
+        />
+      ))}
 
       <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', background: C.bg }}>
 
@@ -683,7 +697,7 @@ export default function App() {
                     <span style={{ color: '#cc8800' }}>compact {current.metrics.compactions}</span>
                   )}
                   <span style={{ color: '#333' }}>|</span>
-                  <span>{(current.metrics.elapsed / 1000).toFixed(1)}s</span>
+                  <span>{current.metrics.elapsed != null ? (current.metrics.elapsed / 1000).toFixed(1) : '—'}s</span>
                 </>
               ) : current?.tokens ? (
                 <>
@@ -935,6 +949,7 @@ function GlobalMetricsPanel() {
   }
 
   const formatUptime = (hours: number) => {
+    if (hours == null || isNaN(hours)) return '—';
     if (hours < 1) return `${Math.round(hours * 60)}m`;
     if (hours < 24) return `${hours.toFixed(1)}h`;
     return `${(hours / 24).toFixed(1)}d`;

@@ -51,12 +51,21 @@ export interface QueueState {
   current: number;   // index of the track to play (−1 = none)
   serial: number;    // bumps whenever the track list changes
   playSerial: number; // bumps whenever a new "play now" command is issued
+  paused: boolean;
+  pauseTime: number; // last-seen playback position (seconds) when paused
 }
 
-const Q: QueueState = { tracks: [], current: -1, serial: 0, playSerial: 0 };
+const Q: QueueState = { tracks: [], current: -1, serial: 0, playSerial: 0, paused: false, pauseTime: 0 };
 
 function queueSnapshot(): QueueState {
-  return { tracks: Q.tracks.slice(), current: Q.current, serial: Q.serial, playSerial: Q.playSerial };
+  return {
+    tracks: Q.tracks.slice(),
+    current: Q.current,
+    serial: Q.serial,
+    playSerial: Q.playSerial,
+    paused: Q.paused,
+    pauseTime: Q.pauseTime,
+  };
 }
 
 /** Append tracks; when `play`, jump playback to the first newly-added track. */
@@ -88,6 +97,33 @@ export function queueRemove(index: number): QueueState {
 
 export function queueClear(): QueueState {
   Q.tracks = []; Q.current = -1; Q.serial++; Q.playSerial++;
+  Q.paused = true; Q.pauseTime = 0;
+  return queueSnapshot();
+}
+
+export function queuePause(): QueueState {
+  Q.paused = true;
+  return queueSnapshot();
+}
+
+export function queueResume(
+  currentTime: number,
+  currentTrack: number,
+): QueueState {
+  if (currentTrack >= 0 && currentTrack < Q.tracks.length) {
+    Q.current = currentTrack;
+    Q.paused = false;
+    Q.pauseTime = currentTime;
+    Q.playSerial++;
+  } else if (currentTrack < 0 && Q.tracks.length > 0) {
+    Q.current = 0;
+    Q.paused = false;
+    Q.pauseTime = currentTime;
+    Q.playSerial++;
+  } else {
+    Q.paused = false;
+    Q.pauseTime = 0;
+  }
   return queueSnapshot();
 }
 
@@ -328,6 +364,14 @@ export function handleMusicRequest(
   }
   if (route === '/api/queue/clear') {
     return json(200, queueClear());
+  }
+  if (route === '/api/queue/pause') {
+    return json(200, queuePause());
+  }
+  if (route === '/api/queue/resume') {
+    const t = parseFloat(url.searchParams.get('time') ?? '0');
+    const i = parseInt(url.searchParams.get('track') ?? '-1', 10);
+    return json(200, queueResume(t, i));
   }
 
   res.writeHead(404); res.end('Not found');
@@ -732,9 +776,11 @@ export function setup(cfg: PluginConfig<MusicConfig>) {
       id: 'music',
       title: 'Open music player',
       icon: '🎵',
-      // Open inside the SPA as a full-screen overlay (same single-page app),
-      // not a separate browser tab.
-      run: () => ({ overlay: `${MOUNT}/player` }),
+      // The SPA renders its own music window via the client-side UI-plugin
+      // registry (see src/ui/plugin-registry.tsx), keyed on this icon's id. The
+      // `open` action is the fallback for non-SPA clients: the standalone
+      // server-rendered player page.
+      run: () => ({ open: `${MOUNT}/player` }),
     });
   }
 

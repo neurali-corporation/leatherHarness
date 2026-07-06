@@ -523,7 +523,7 @@ interface ActiveSession {
   closeServer: () => void;
 }
 
-const activeSessions = new Map<string, ActiveSession>(); // keyed by absolute file path
+export const activeSessions = new Map<string, ActiveSession>(); // keyed by absolute file path
 
 function castStream(
   ip: string, mediaUrl: string, contentType: string, streamType = 'BUFFERED', subtitleUrl: string | null = null,
@@ -669,6 +669,110 @@ function castStop(ip: string, sessionId: string): Promise<void> {
         send('sender-0', 'receiver-0', NS_RECV, { type: 'STOP', requestId: 1, sessionId });
       }
       setTimeout(() => { socket.destroy(); resolve(); }, 1000);
+    });
+  });
+}
+
+function castGetStatus(ip: string): Promise<Record<string, unknown>> {
+  const NS_CONN = 'urn:x-cast:com.google.cast.tp.connection';
+  const NS_HEART = 'urn:x-cast:com.google.cast.tp.heartbeat';
+  const NS_RECV = 'urn:x-cast:com.google.cast.receiver';
+  const NS_MEDIA = 'urn:x-cast:com.google.cast.media';
+
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({ host: ip, port: 8009, rejectUnauthorized: false });
+    let rxBuf = Buffer.alloc(0);
+    let heartbeat: NodeJS.Timeout;
+    let timeout: NodeJS.Timeout;
+    let resolved = false;
+    let receiverStatus: Record<string, unknown> | null = null;
+    let mediaStatus: Record<string, unknown> | null = null;
+
+    const send = (src: string, dst: string, ns: string, msg: object) => {
+      try { socket.write(encodeCastMsg(src, dst, ns, JSON.stringify(msg))); }
+      catch (e: unknown) { console.error(`[chromecast] send error: ${(e as Error).message}`); }
+    };
+
+    const finish = (status: Record<string, unknown>) => {
+      if (resolved) return;
+      resolved = true;
+      clearInterval(heartbeat);
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve(status);
+    };
+
+    const fail = (reason: string) => {
+      if (resolved) return;
+      resolved = true;
+      clearInterval(heartbeat);
+      clearTimeout(timeout);
+      socket.destroy();
+      reject(new Error(reason));
+    };
+
+    socket.on('error', (e) => fail(`Cast error: ${e.message}`));
+    socket.on('close', () => {
+      if (!resolved) fail('Connection closed before status received');
+    });
+
+    socket.on('data', (chunk: Buffer) => {
+      rxBuf = Buffer.concat([rxBuf, chunk]);
+      while (rxBuf.length >= 4) {
+        const msgLen = rxBuf.readUInt32BE(0);
+        if (rxBuf.length < 4 + msgLen) break;
+        const raw = rxBuf.slice(4, 4 + msgLen);
+        rxBuf = rxBuf.slice(4 + msgLen);
+        const msg = decodeCastMsg(raw);
+        if (!msg) { console.warn('[chromecast] could not decode message'); continue; }
+
+        const short = msg.namespace.split(':').pop();
+        console.log(`[chromecast] ← ${short} ${msg.payload}`);
+
+        try {
+          const p = JSON.parse(msg.payload) as Record<string, unknown>;
+
+          if (msg.namespace === NS_HEART && p['type'] === 'PING') {
+            send('sender-0', 'receiver-0', NS_HEART, { type: 'PONG' });
+          }
+
+          if (msg.namespace === NS_RECV && p['type'] === 'RECEIVER_STATUS') {
+            receiverStatus = p;
+            console.log(`[chromecast] receiver status received, requesting media status`);
+            // Request media status if there's an active app
+            const apps = ((p['status'] as Record<string, unknown>)?.['applications'] as Record<string, unknown>[]);
+            if (apps?.length) {
+              const app = apps[0];
+              const transportId = app['transportId'] as string;
+              send('sender-0', transportId, NS_MEDIA, { type: 'GET_STATUS', requestId: 1 });
+            } else {
+              // No active app, finish with receiver status only
+              finish(receiverStatus);
+            }
+          }
+
+          if (msg.namespace === NS_MEDIA && p['type'] === 'STATUS') {
+            mediaStatus = p;
+            console.log(`[chromecast] media status received, finishing`);
+            finish({
+              ...(receiverStatus ?? {}),
+              mediaStatus,
+            });
+          }
+        } catch (e: unknown) {
+          console.error(`[chromecast] message parse error: ${(e as Error).message}`);
+        }
+      }
+    });
+
+    socket.on('secureConnect', () => {
+      console.log(`[chromecast] TLS connected, requesting status`);
+      send('sender-0', 'receiver-0', NS_CONN, { type: 'CONNECT' });
+      send('sender-0', 'receiver-0', NS_RECV, { type: 'GET_STATUS', requestId: 1 });
+      heartbeat = setInterval(() => send('sender-0', 'receiver-0', NS_HEART, { type: 'PING' }), 5000);
+      timeout = setTimeout(() => {
+        if (!resolved) fail('Timed out waiting for Chromecast status response');
+      }, 10000);
     });
   });
 }
@@ -841,6 +945,25 @@ export function setup(cfg: PluginConfig<ChromecastConfig>) {
         closeServer();
         return `ERROR: ${(e as Error).message}`;
       }
+    },
+  });
+
+  registerNativeTool({
+    name: 'chromecast_status',
+    description: 'List all currently active Chromecast streams (handles) and their live device state. Returns a JSON array of { path, ip, sessionId, live } for each active session, where `live` is the receiver/media status queried from the device (or `error` if the device could not be reached).',
+    parameters: { type: 'object', properties: {}, required: [] },
+    execute: async () => {
+      const entries = [...activeSessions.entries()];
+      if (!entries.length) return 'No active Chromecast streams.';
+      const sessions = await Promise.all(entries.map(async ([path, s]) => {
+        const base = { path, ip: s.ip, sessionId: s.sessionId };
+        try {
+          return { ...base, live: await castGetStatus(s.ip) };
+        } catch (e: unknown) {
+          return { ...base, error: (e as Error).message };
+        }
+      }));
+      return JSON.stringify(sessions, null, 2);
     },
   });
 
