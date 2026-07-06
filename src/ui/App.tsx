@@ -480,7 +480,7 @@ export default function App() {
           <button onClick={createSession} style={btnStyle(C)}>+ New Session</button>
         </div>
       )}
-      <div style={{ flex: 1, overflowY: 'auto' }}>
+      <div style={{ flexShrink: 0 }}>
         {Object.values(sessions).map(s => (
           <div
             key={s.id}
@@ -504,54 +504,42 @@ export default function App() {
           </div>
         ))}
       </div>
-      {pluginIcons.filter(p => !uiPlugins.some(u => u.id === p.id)).length > 0 && (
-        <div style={{
-          flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '8px 10px',
-          display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center',
-        }}>
-          {pluginIcons.filter(p => !uiPlugins.some(u => u.id === p.id)).map(p => (
-            <button
-              key={p.id}
-              onClick={() => runPluginIcon(p.id)}
-              title={p.title}
-              aria-label={p.title}
-              style={{
-                width: 34, height: 34, fontSize: 17, lineHeight: 1,
-                background: C.surface2, border: `1px solid ${C.border}`,
-                borderRadius: 8, cursor: 'pointer', color: C.text,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}
-            >{p.icon}</button>
-          ))}
-        </div>
-      )}
-
-      {/* UI-plugin launchers (registry-driven) */}
-      {uiPlugins.length > 0 && (
-        <div style={{ borderTop: `1px solid ${C.border}`, padding: '8px 10px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {uiPlugins.map(p => (
-            <button
-              key={p.id}
-              onClick={() => setOpenPlugin(p.id)}
-              style={{
-                width: '100%',
-                padding: '6px 0',
-                background: C.accentDim,
-                border: `1px solid ${C.accentBorder}`,
-                color: C.accent,
-                borderRadius: 7,
-                cursor: 'pointer',
-                fontSize: 13,
-                fontWeight: 500,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: 6,
-              }}
-            >
-              {p.icon} {p.title}
-            </button>
-          ))}
+      {/* Plugins — every plugin contributes a single-emoji icon button.
+          UI plugins (registry-driven) open their window; server-contributed
+          icons run their action. Each plugin defines its own emoji. */}
+      {(uiPlugins.length > 0 || pluginIcons.some(p => !uiPlugins.some(u => u.id === p.id))) && (
+        <div style={{ flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.6, textTransform: 'uppercase', color: C.muted }}>Plugins</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+            {uiPlugins.map(p => (
+              <button
+                key={p.id}
+                onClick={() => setOpenPlugin(p.id)}
+                title={p.title}
+                aria-label={p.title}
+                style={{
+                  width: 34, height: 34, fontSize: 17, lineHeight: 1,
+                  background: C.surface2, border: `1px solid ${C.border}`,
+                  borderRadius: 8, cursor: 'pointer', color: C.text,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}
+              >{p.icon}</button>
+            ))}
+            {pluginIcons.filter(p => !uiPlugins.some(u => u.id === p.id)).map(p => (
+              <button
+                key={p.id}
+                onClick={() => runPluginIcon(p.id)}
+                title={p.title}
+                aria-label={p.title}
+                style={{
+                  width: 34, height: 34, fontSize: 17, lineHeight: 1,
+                  background: C.surface2, border: `1px solid ${C.border}`,
+                  borderRadius: 8, cursor: 'pointer', color: C.text,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}
+              >{p.icon}</button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -1015,8 +1003,9 @@ function GlobalMetricsPanel() {
     );
   }
 
-  const formatUptime = (hours: number) => {
-    if (hours == null || isNaN(hours)) return '—';
+  const formatUptime = (raw: number | string) => {
+    const hours = Number(raw);
+    if (raw == null || isNaN(hours)) return '—';
     if (hours < 1) return `${Math.round(hours * 60)}m`;
     if (hours < 24) return `${hours.toFixed(1)}h`;
     return `${(hours / 24).toFixed(1)}d`;

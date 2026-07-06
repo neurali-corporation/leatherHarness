@@ -260,14 +260,12 @@ export function createModelLauncher(config: ModelLauncherConfig) {
       // "couldn't bind HTTP server socket".
       await freePort(extractPort(allArgs));
 
-      // detached: give llama-server its own process group so a controlling-
-      // terminal / SSH disconnect (SIGHUP to the foreground group) doesn't reach
-      // it and kill the expensive-to-reload model. We keep the ref (no unref) so
-      // the child's lifetime is still managed by the harness, and stop/cleanup
-      // kill it explicitly by pid.
+      // Spawn in the harness's own process group (not detached) so the model's
+      // lifetime is tied to the harness: a controlling-terminal / SSH disconnect
+      // (SIGHUP) or any group-wide signal takes down the model along with the
+      // harness. stop/cleanup also kill it explicitly by pid.
       const proc = spawn(cmd, allArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        detached: true,
       });
 
       currentProcess = proc;
@@ -449,22 +447,12 @@ function registerExitCleanup(): void {
   };
 
   process.on('exit', cleanup);
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  // SIGHUP (terminal / SSH disconnect) is handled like SIGINT/SIGTERM: the
+  // harness shuts down and kills the model process with it.
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     process.on(sig, () => {
       cleanup();
       process.exit(0);
-    });
-  }
-
-  // Optionally survive SIGHUP: a controlling-terminal / SSH disconnect must not
-  // take a long-running harness down. Registering any handler overrides Node's
-  // default (terminate). Combined with the detached child spawn, neither the
-  // harness nor llama-server dies when the terminal goes away. This is opt-in —
-  // pass --survive-hup (or SURVIVE_HUP=1) at startup — so that by default a
-  // terminal hangup still terminates the harness the way Node normally would.
-  if (process.argv.includes('--survive-hup') || process.env.SURVIVE_HUP === '1') {
-    process.on('SIGHUP', () => {
-      console.warn('↩️  Ignoring SIGHUP (terminal disconnect); harness stays up');
     });
   }
 }

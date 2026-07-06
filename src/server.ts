@@ -4,6 +4,7 @@ import { resolve as resolvePath, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { loadPlugins } from './plugin-loader.ts';
 import { loadMcpServers } from './mcp.ts';
+import { registerScrapeTool } from './scrape.ts';
 import { resolveRequest } from './resolve.ts';
 import { matchRoute } from './http-registry.ts';
 import { setListen, noteHost } from './runtime.ts';
@@ -45,6 +46,7 @@ async function main() {
   });
   const config = JSON.parse(cfgData);
   await loadMcpServers(config.mcpServers ?? {});
+  registerScrapeTool();
 
   // Initialize model launcher if enabled
   if (config.enableModelLauncher) {
@@ -293,7 +295,7 @@ async function main() {
     // Metrics endpoint (local harness stats)
     if (req.method === 'GET' && pathname === '/api/metrics') {
       const uptime = Date.now() - globalStats.startTime;
-      const uptimeHours = (uptime / 3600000).toFixed(1);
+      const uptimeHours = uptime / 3600000;
       const avgTokensPerRequest = globalStats.totalRequests > 0
         ? Math.round(globalStats.totalTokens / globalStats.totalRequests)
         : 0;

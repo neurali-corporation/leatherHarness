@@ -384,6 +384,197 @@ interface UiActionResult {
 
 ---
 
+## walkthrough: writing a plugin
+
+Two complete, copy-pasteable examples. The first is a plain tool-only plugin (an
+"MCP-style" tool the model can call). The second adds a UI component that shows up
+as an icon in the sidebar's **Plugins** row and opens its own window.
+
+### 1. A simple tool plugin
+
+This is the whole plugin — one file, no UI. It exposes a `dice` tool and reads a
+configurable default from `config.json`.
+
+Create `plugins/dice/index.ts`:
+
+```ts
+import { registerNativeTool } from '../../src/registry.ts';
+import type { PluginConfig } from '../../src/plugin-loader.ts';
+
+// Seeded into config.json (under pluginConfig.dice) on first run.
+interface DiceConfig { sides: number; }
+export const defaultConfig: DiceConfig = { sides: 6 };
+
+export function setup(cfg: PluginConfig<DiceConfig>) {
+  registerNativeTool({
+    name: 'dice',
+    // The description is what the model sees — make it clear and specific.
+    description: 'Roll one or more dice and return the results and their sum.',
+    parameters: {
+      type: 'object',
+      properties: {
+        count: { type: 'number', description: 'How many dice to roll (default 1).' },
+        sides: { type: 'number', description: 'Faces per die (default from config).' },
+      },
+      required: [],
+    },
+    execute: async ({ count = 1, sides }: { count?: number; sides?: number }) => {
+      const faces = sides ?? (await cfg.get()).sides;      // fall back to config
+      const rolls = Array.from({ length: count }, () => 1 + Math.floor(Math.random() * faces));
+      return JSON.stringify({ rolls, sum: rolls.reduce((a, b) => a + b, 0) });
+    },
+  });
+}
+```
+
+That's it. Restart the harness — `loadPlugins()` discovers the folder, calls
+`setup(cfg)`, and the tool is registered as `hx__dice` in the schema sent to the
+model. Anything a `execute` returns (always a string) is looped back to the model
+as the tool result.
+
+Notes:
+- **`name` must be unique across all plugins** — it's registered globally and a
+  collision throws on startup.
+- Keep `execute` returning a `string`; serialize objects with `JSON.stringify`.
+- Read config lazily inside `execute` (via `await cfg.get()`) so edits to
+  `config.json` take effect without a restart.
+
+### 2. A plugin with a UI component
+
+A UI plugin has **two** files in its folder:
+
+```
+plugins/scratchpad/
+  index.ts     ← server side: tool(s), an HTTP route for data, and a UI icon
+  ui.tsx       ← client side: a React component, discovered by Vite at build time
+```
+
+The client (`src/ui/plugin-registry.tsx`) globs every `plugins/*/ui.tsx` at build
+time, so there's no import list to maintain — just drop the file in. The component
+is always mounted and told via an `open` prop whether its window should be visible
+(so it can keep state — e.g. audio playback — alive while closed). The sidebar
+shows each plugin's `icon`; clicking it opens the matching component (matched by
+`id`).
+
+**`plugins/scratchpad/index.ts`** — a shared server-side note, an HTTP route to
+read/write it, a tool so the model can use it too, and the sidebar icon:
+
+```ts
+import { registerNativeTool } from '../../src/registry.ts';
+import { registerHttpRoute } from '../../src/http-registry.ts';
+import { registerUiIcon } from '../../src/ui-registry.ts';
+import type { PluginConfig } from '../../src/plugin-loader.ts';
+
+const MOUNT = '/scratchpad';          // where this plugin's routes live
+let note = '';                        // one shared value (swap for real storage)
+
+export function setup(_cfg: PluginConfig) {
+  // HTTP route: GET returns the note, POST replaces it. registerHttpRoute matches
+  // MOUNT and anything below it, so strip the prefix to get the sub-route.
+  registerHttpRoute(MOUNT, async (req, res) => {
+    const sub = new URL(req.url ?? '/', 'http://x').pathname.slice(MOUNT.length) || '/';
+    if (sub === '/api/note' && req.method === 'POST') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      note = JSON.parse(body).note ?? '';
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ note }));
+  });
+
+  // Sidebar icon. `id` MUST equal the UiPlugin id in ui.tsx so the SPA opens the
+  // React component. `run` is the fallback for non-SPA clients (open a URL etc.).
+  registerUiIcon({
+    id: 'scratchpad',
+    title: 'Scratchpad',
+    icon: '📝',
+    run: () => ({ message: 'Open the scratchpad from the Plugins row.' }),
+  });
+
+  // Optional: let the model read/write the same note.
+  registerNativeTool({
+    name: 'scratchpad_set',
+    description: 'Replace the shared scratchpad note.',
+    parameters: {
+      type: 'object',
+      properties: { note: { type: 'string' } },
+      required: ['note'],
+    },
+    execute: async ({ note: n }: { note: string }) => { note = n; return 'Saved.'; },
+  });
+}
+```
+
+**`plugins/scratchpad/ui.tsx`** — the React window. It default-exports a
+`UiPlugin` descriptor; `id` matches the icon above:
+
+```tsx
+import React, { useEffect, useState } from 'react';
+import type { UiPlugin, UiPluginProps } from '../../src/ui/plugin-registry';
+
+const BASE = '/scratchpad';   // same origin the SPA is served from
+
+function Scratchpad({ open, onClose }: UiPluginProps) {
+  const [note, setNote] = useState('');
+
+  // Load the note whenever the window opens.
+  useEffect(() => {
+    if (!open) return;
+    fetch(`${BASE}/api/note`).then(r => r.json()).then(d => setNote(d.note ?? ''));
+  }, [open]);
+
+  const save = async (text: string) => {
+    setNote(text);
+    await fetch(`${BASE}/api/note`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: text }),
+    });
+  };
+
+  // The component is always mounted; render nothing while closed.
+  if (!open) return null;
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 100, background: '#0a0a0a',
+                  color: '#e0e0e0', display: 'flex', flexDirection: 'column', padding: 20 }}>
+      <button onClick={onClose} style={{ alignSelf: 'flex-start', marginBottom: 12 }}>← Close</button>
+      <textarea
+        value={note}
+        onChange={e => save(e.target.value)}
+        style={{ flex: 1, background: '#141414', color: '#e0e0e0',
+                 border: '1px solid #252525', borderRadius: 8, padding: 12 }}
+      />
+    </div>
+  );
+}
+
+const plugin: UiPlugin = {
+  id: 'scratchpad',       // must match registerUiIcon({ id }) in index.ts
+  title: 'Scratchpad',
+  icon: '📝',             // the sidebar shows this single emoji
+  Component: Scratchpad,
+};
+
+export default plugin;
+```
+
+Restart the harness and rebuild the UI. The 📝 icon appears in the **Plugins** row
+in the sidebar; clicking it opens the window, which reads and writes the shared
+note through the plugin's own HTTP route. The `music` plugin is the full-featured
+reference for this pattern.
+
+Key points:
+- The `id` in `ui.tsx` and in `registerUiIcon` **must be identical** — that's how a
+  click is routed to the component.
+- Serve data from your own `registerHttpRoute(MOUNT, …)` and fetch it with
+  relative URLs (`/scratchpad/...`) so it works on any host without extra config.
+- Because the component stays mounted, put anything that must survive close/reopen
+  (timers, `<audio>`, websockets) at the top level and gate only the visible UI on
+  `open`.
+
+---
+
 ## ships with
 
 | Plugin | Tools | What it does |
