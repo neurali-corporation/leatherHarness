@@ -4,7 +4,6 @@ import { resolve as resolvePath, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { loadPlugins } from './plugin-loader.ts';
 import { loadMcpServers } from './mcp.ts';
-import { registerScrapeTool } from './scrape.ts';
 import { resolveRequest } from './resolve.ts';
 import { matchRoute } from './http-registry.ts';
 import { setListen, noteHost } from './runtime.ts';
@@ -46,7 +45,6 @@ async function main() {
   });
   const config = JSON.parse(cfgData);
   await loadMcpServers(config.mcpServers ?? {});
-  registerScrapeTool();
 
   // Initialize model launcher if enabled
   if (config.enableModelLauncher) {
