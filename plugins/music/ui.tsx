@@ -319,10 +319,8 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
   const currentTrack = queue.current >= 0 ? queue.tracks[queue.current] : null;
 
   const handleClose = () => {
-    // Pause playback and save position before closing UI.
-    if (audioRef.current) {
-      audioRef.current.pause();
-    }
+    // Leave playback running — the <audio> element stays mounted (see below),
+    // so closing the window just hides the UI while music keeps playing.
     onClose();
   };
 
