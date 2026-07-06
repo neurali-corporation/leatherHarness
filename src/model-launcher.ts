@@ -95,6 +95,21 @@ let currentProcess: ChildProcess | null = null;
 let currentModelName: string | null = null;
 let launcherConfig: ModelLauncherConfig | null = null;
 
+// Set true whenever *we* take the process down (stop / switch / harness exit) so
+// its 'exit' event isn't mistaken for a crash and auto-restarted.
+let intentionalStop = false;
+// Consecutive crash count, for exponential restart backoff. Reset once a process
+// has stayed up long enough to be considered healthy.
+let restartAttempts = 0;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+
+function cancelPendingRestart(): void {
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
+  }
+}
+
 /**
  * Parse a launcher shell script to extract the llama-server command, params, and metadata.
  * This is used to generate config from launcher scripts.
@@ -215,6 +230,8 @@ export function createModelLauncher(config: ModelLauncherConfig) {
   launcherConfig = config;
 
   const startModel = async (modelName: string) => {
+    // A manual (re)start supersedes any pending auto-restart.
+    cancelPendingRestart();
     if (currentProcess) {
       await stopModel();
     }
@@ -243,26 +260,55 @@ export function createModelLauncher(config: ModelLauncherConfig) {
       // "couldn't bind HTTP server socket".
       await freePort(extractPort(allArgs));
 
+      // detached: give llama-server its own process group so a controlling-
+      // terminal / SSH disconnect (SIGHUP to the foreground group) doesn't reach
+      // it and kill the expensive-to-reload model. We keep the ref (no unref) so
+      // the child's lifetime is still managed by the harness, and stop/cleanup
+      // kill it explicitly by pid.
       const proc = spawn(cmd, allArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        detached: false,
+        detached: true,
       });
 
       currentProcess = proc;
       currentModelName = modelName;
+      intentionalStop = false;
+      const startedAt = Date.now();
 
       proc.on('error', (err) => {
         console.error(`❌ Failed to start model ${modelName}:`, err.message);
-        currentProcess = null;
-        currentModelName = null;
-      });
-
-      proc.on('exit', (code, signal) => {
-        console.log(`Model ${modelName} exited with code ${code}, signal ${signal}`);
         if (currentProcess === proc) {
           currentProcess = null;
           currentModelName = null;
         }
+      });
+
+      proc.on('exit', (code, signal) => {
+        console.log(`Model ${modelName} exited with code ${code}, signal ${signal}`);
+        // Ignore a stale process that a newer start already superseded.
+        if (currentProcess !== proc) return;
+        currentProcess = null;
+        currentModelName = null;
+
+        // We took it down on purpose (stop / switch / harness shutdown) — done.
+        if (intentionalStop) {
+          intentionalStop = false;
+          return;
+        }
+        if (!config.enableModelLauncher) return;
+
+        // Unexpected exit (backend crash, OOM, template abort). Respawn so a
+        // transient failure doesn't leave the harness without a model, but back
+        // off exponentially so a genuine crash-loop doesn't hammer the GPU.
+        if (Date.now() - startedAt > 30000) restartAttempts = 0; // was healthy
+        restartAttempts++;
+        const backoff = Math.min(1000 * 2 ** (restartAttempts - 1), 30000);
+        console.warn(`♻️  Model ${modelName} exited unexpectedly (code ${code}, signal ${signal}); restarting in ${backoff}ms (attempt ${restartAttempts})`);
+        cancelPendingRestart();
+        restartTimer = setTimeout(() => {
+          restartTimer = null;
+          startModel(modelName).catch(e => console.error(`❌ Auto-restart of ${modelName} failed:`, e.message));
+        }, backoff);
       });
 
       // Log stdout/stderr
@@ -290,6 +336,11 @@ export function createModelLauncher(config: ModelLauncherConfig) {
 
     const modelName = currentModelName;
     const pid = currentProcess.pid;
+
+    // Mark as deliberate so the 'exit' handler doesn't auto-restart it, and
+    // drop any restart the previous crash may have already queued.
+    intentionalStop = true;
+    cancelPendingRestart();
 
     console.log(`🛑 Stopping model: ${modelName} (PID: ${pid})`);
 
@@ -388,6 +439,8 @@ function registerExitCleanup(): void {
   exitHandlersRegistered = true;
 
   const cleanup = () => {
+    intentionalStop = true;
+    cancelPendingRestart();
     if (currentProcess) {
       try { currentProcess.kill('SIGKILL'); } catch {}
       currentProcess = null;
@@ -396,12 +449,20 @@ function registerExitCleanup(): void {
   };
 
   process.on('exit', cleanup);
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     process.on(sig, () => {
       cleanup();
       process.exit(0);
     });
   }
+
+  // Deliberately survive SIGHUP: a controlling-terminal / SSH disconnect must not
+  // take a long-running harness down. Registering any handler overrides Node's
+  // default (terminate). Combined with the detached child spawn, neither the
+  // harness nor llama-server dies when the terminal goes away.
+  process.on('SIGHUP', () => {
+    console.warn('↩️  Ignoring SIGHUP (terminal disconnect); harness stays up');
+  });
 }
 
 export function initModelLauncher(config: ModelLauncherConfig): void {
@@ -410,6 +471,8 @@ export function initModelLauncher(config: ModelLauncherConfig): void {
 }
 
 export function resetModelLauncher(): void {
+  intentionalStop = true;
+  cancelPendingRestart();
   if (currentProcess) {
     try {
       currentProcess.kill('SIGKILL');
@@ -417,5 +480,6 @@ export function resetModelLauncher(): void {
   }
   currentProcess = null;
   currentModelName = null;
+  restartAttempts = 0;
   launcherConfig = null;
 }

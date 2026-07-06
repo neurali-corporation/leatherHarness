@@ -91,7 +91,21 @@ async function callUpstream(url: string, payload: object): Promise<UpstreamResul
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         lastErr = `upstream HTTP ${res.status}${text ? `: ${text.slice(0, 300)}` : ''}`;
-        // Retry only on rate-limit / server errors; client errors won't improve on retry.
+        // llama.cpp (--jinja) builds a tool-call parser by rendering the model's
+        // chat template; some templates (Qwen3-style, used by Ornith) 400 with a
+        // raise_exception during that generation for certain message shapes.
+        // Tools aren't required to get *an* answer, so retry the call once without
+        // them rather than failing the whole round.
+        if (
+          res.status === 400 &&
+          /parser|No user query|raise_exception/i.test(text) &&
+          (payload as any).tools?.length
+        ) {
+          console.warn('⚠️  Upstream rejected tool-parser generation; retrying without tools');
+          const { tools, ...noTools } = payload as any;
+          return callUpstream(url, noTools);
+        }
+        // Retry only on rate-limit / server errors; other client errors won't improve on retry.
         if (res.status === 429 || res.status >= 500) { await delay(500 * attempt); continue; }
         return { ok: false, error: lastErr };
       }
@@ -132,6 +146,18 @@ async function compactMessages(
 
   if (messagesToCompact.length === 0) return messages;
 
+  // Some chat templates (Qwen3-style, used by Ornith) raise
+  // "No user query found in messages." during llama.cpp's --jinja tool-call
+  // parser generation when the request has no `user` turn at all. Compaction
+  // otherwise drops the original request into the summarized half, leaving a
+  // tail of only assistant/tool messages — so carry the earliest user turn
+  // forward whenever the kept tail contains none.
+  const preserveUserTurn = (kept: any[]): any[] => {
+    if (kept.some((m: any) => m.role === 'user')) return kept;
+    const firstUser = messages.find((m: any) => m.role === 'user');
+    return firstUser ? [firstUser, ...kept] : kept;
+  };
+
   // Build a compacted summary by asking the model to summarize
   const compactPayload = {
     messages: [
@@ -154,7 +180,7 @@ async function compactMessages(
       // Replace old messages with the summary
       return [
         { role: 'system', content: `[Compacted Conversation Summary]\n${summary}` },
-        ...messagesToKeep,
+        ...preserveUserTurn(messagesToKeep),
       ];
     }
   } catch (e) {
@@ -163,7 +189,7 @@ async function compactMessages(
 
   // If compaction fails, just truncate without summary
   console.log(`✂️  Compaction failed, truncating to last ${messagesToKeep.length} messages`);
-  return messagesToKeep;
+  return preserveUserTurn(messagesToKeep);
 }
 
 export async function resolveRequest(body: any, config: any, emit?: Emit): Promise<any> {

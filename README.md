@@ -127,6 +127,154 @@ config directory — **not** in the project folder:
 
 ---
 
+## the loop, in detail
+
+The whole engine is one function — `resolveRequest(body, config, emit?)` in
+`src/resolve.ts`. Everything below happens there unless noted.
+
+### Two modes: streaming vs blocking
+
+The presence of the `emit` callback decides how results come back:
+
+- **Streaming mode** (`emit` provided). `resolveRequest` returns `null` and pushes
+  typed `{ t, … }` events through `emit` as it goes. `src/server.ts` wraps `emit`
+  to either pass those events straight through (web UI, `X-Leather-UI: 1`) or
+  translate them into OpenAI `chat.completion.chunk`s (every other client).
+- **Blocking mode** (no `emit`). `resolveRequest` returns the upstream JSON
+  response object for the final round, or `{ error: { message } }` on failure.
+
+Either way, **the harness always calls the upstream model non-streaming**
+(`stream: false`) — one discrete request per round. Client-side streaming is
+synthesized in `server.ts` from those round results; it is never a passthrough of
+the upstream token stream.
+
+### Per-request setup (runs once, before the loop)
+
+1. **Limits.** `maxRounds = maxToolRounds || 5`, `maxMessages = maxMessages || 50`.
+2. **Working transcript.** `body.messages` is copied into a mutable `messages`
+   array that grows as the loop appends assistant/tool turns.
+3. **Metrics accumulator.** Start time plus cumulative `prompt/completion/total`
+   tokens, `rounds`, `toolCalls`, `compactions`.
+4. **Memo injection.** `readMemoContent()` loads the main memo markdown. If present
+   it's wrapped as `[Persistent Session Memory]` and either appended to the first
+   existing `system` message or unshifted as a new one. Sub-memo file names are
+   appended as a one-liner so the model can pull them on demand via `read_memo`.
+   This is best-effort — any failure is swallowed.
+5. **Tool sources captured.** `clientTools = body.tools ?? []` and the upstream URL.
+
+### The round loop (`for round in 0 … maxRounds-1`)
+
+Each iteration does the following, in order:
+
+**A. Compaction check (before calling the model).** If `messages.length > maxMessages`,
+run `compactMessages()` (below), replace the transcript in place, bump the
+`compactions` metric, and emit a metrics snapshot.
+
+**B. Assemble tools.** `tools = [...clientTools, ...toolSchemas()]` — the caller's
+own tools plus every `hx__`-prefixed native/MCP tool in the registry.
+
+**C. Build payload.** `{ ...body, messages, tools, stream: false }`.
+
+**D. Call upstream.** `callUpstream()` (below). On failure, emit `error` + `done`
+and return `null` (streaming), or return `{ error }` (blocking) — the loop stops.
+
+**E. Parse the reply.** `msg = choices[0].message`; `calls = msg.tool_calls || []`;
+`splitReasoning(msg)` separates thinking from the answer. If there's reasoning and
+we're streaming, emit a `reasoning` event. The round's `usage` token counts are
+folded into the cumulative metrics.
+
+**F. Decide how the round ends — three outcomes:**
+
+1. **No tool calls → final answer.** Streaming: emit `delta(content)`, a final
+   metrics snapshot, then `done`; return `null`. Blocking: return the raw upstream
+   `data`.
+2. **Foreign tool calls → relay to client.** A call is "foreign" if its name is
+   **not** a registered harness tool (`hasTool()` is false — i.e. it's one of the
+   client's own tools). If *any* call in the batch is foreign, the harness executes
+   **none** of them and forwards the whole `tool_calls` batch to the client
+   (streaming sets `finish_reason: tool_calls`). The web UI never sends tools, so it
+   never hits this branch.
+3. **All harness tools → execute and loop.** The assistant message (carrying the
+   `tool_calls`) is pushed to the transcript, then for each call:
+   - `arguments` is `JSON.parse`d (invalid JSON silently becomes `{}`).
+   - emit `tool_call(id, name, args)`.
+   - execute via `getTool(name).execute(args)`; the result is stringified
+     (`JSON.stringify` if it isn't already a string).
+   - **Tool errors are isolated** — a throw is caught and turned into
+     `ERROR: <tool> failed: …`, which is fed back as the tool result. A failing
+     tool never breaks the loop; the model gets the error and can recover.
+   - emit `tool_result(id, name, out)`, then push
+     `{ role: 'tool', tool_call_id, content: out }` to the transcript.
+
+   A metrics snapshot is emitted and the loop continues to the next round with the
+   enlarged transcript.
+
+**G. Termination.** If the loop completes all `maxRounds` iterations without ever
+reaching a final answer, that's the loop guard: emit `error` (`Tool round limit …`)
++ `done` (streaming) or return `{ error }` (blocking).
+
+```
+round N:
+  messages.length > maxMessages ? ─yes→ compactMessages() ─┐
+                     │                                       │
+                     ▼                                       ▼
+  payload = { ...body, messages, tools: client+native, stream:false }
+                     │
+                     ▼
+             callUpstream() ──fail──► emit error+done / return {error}
+                     │ ok
+                     ▼
+        split reasoning / content, add usage to metrics
+                     │
+        ┌────────────┼─────────────────────────────┐
+        ▼            ▼                              ▼
+   no tool_calls   foreign calls             all native calls
+   → final answer  → relay to client         → run tools, append
+     (delta+done)    (tool_calls+done)          results, loop → round N+1
+```
+
+### `callUpstream()` — resilient single call
+
+`POST {upstreamUrl}/chat/completions`, up to **10 attempts**:
+
+- **Thrown/connection errors** (`ECONNREFUSED`/`ENOTFOUND`/`ETIMEDOUT`) back off
+  exponentially (1s → 30s cap); other thrown errors back off `500ms × attempt`.
+- **HTTP `429` or `≥500`** are retried (`500ms × attempt`); other `4xx` return
+  immediately as an error — **except** the tools-less `400` fallback: a `400` whose
+  body matches `/parser|No user query|raise_exception/i` **and** whose payload
+  carried `tools` triggers exactly one recursive retry with `tools` stripped, so a
+  template that can't have a tool-parser generated degrades to a plain completion.
+- A `200` with **no** `choices[0].message` is treated as transient and retried.
+- Returns a discriminated union: `{ ok: true, data }` or `{ ok: false, error }`.
+
+### `compactMessages()` — keeping the context window bounded
+
+Triggered at the top of a round when the transcript exceeds `maxMessages`:
+
+- `keepFromEnd = ceil(maxMessages / 2)` splits the transcript into an older
+  **head** (`messagesToCompact`) and a recent **tail** (`messagesToKeep`).
+- A **separate, tool-less** upstream call asks the model to summarize the head into
+  plain factual text.
+- **Success:** returns `[ { role:'system', '[Compacted Conversation Summary] …' },
+  …preserveUserTurn(tail) ]` and emits a `compact` event.
+- **Failure** (the call failed or threw): falls back to plain truncation —
+  `preserveUserTurn(tail)` only, no summary.
+- **`preserveUserTurn`**: if the kept tail has no `user`-role message, it prepends
+  the earliest `user` message from the whole transcript. This guarantees every
+  request the loop sends still contains a user turn — without it, Qwen3-style
+  templates raise `No user query found in messages.` during llama.cpp's `--jinja`
+  tool-parser generation and 400 the request.
+
+### `splitReasoning()` — separating thinking from the answer
+
+Reasoning is pulled from a dedicated field (`reasoning_content` DeepSeek-style, or
+`reasoning` o1-style) **and** from inline `<think>…</think>` blocks embedded in
+`content` (including an unclosed trailing `<think>`). The think-tags are stripped
+from `content` so they never leak into the user-visible answer, and the combined
+reasoning is emitted as a `reasoning` event.
+
+---
+
 ## plugins
 
 Drop a folder in `plugins/`. If it exports `setup(cfg)`, it loads on start — no
@@ -283,6 +431,7 @@ introspection.
 | `src/registry.ts` | Native tool registry. Produces OpenAI-compatible tool schemas and resolves tool names at execution time. |
 | `src/plugin-loader.ts` | Discovers `plugins/` subdirectories, calls `setup(cfg)`, and generates `config.json` defaults on first run. |
 | `src/mcp.ts` | Loads MCP server specs from config and registers a dummy tool per server. |
+| `src/model-launcher.ts` | Optional local model launcher: parses launcher scripts, starts/stops/switches the upstream model process, frees stale ports, auto-restarts on crash, and survives SIGHUP. |
 | `src/http-registry.ts` | HTTP route registry for plugin-mounted endpoints (e.g. `/music`). |
 | `src/ui-registry.ts` | UI icon registry for plugin-contributed toolbar icons. |
 | `src/runtime.ts` | Shared view of the harness listen address. Plugins build absolute URLs using the observed Host header. |
@@ -340,7 +489,22 @@ When `stream: true`, leatherHarness emits typed SSE events:
 - **Conversation compaction** — when messages exceed `maxMessages` (default 50),
   the upstream LLM summarizes the older half into a single system message, then
   continues with the summary + recent messages. If compaction fails, messages are
-  truncated to the most recent `maxMessages/2`.
+  truncated to the most recent `maxMessages/2`. Compaction always carries the
+  earliest `user` turn forward, so the outgoing request never ends up with no
+  user message — some chat templates (Qwen3-style) raise during llama.cpp's
+  `--jinja` tool-parser generation when there is no user turn.
+- **Tools-less 400 fallback** — if the upstream returns a `400` from tool-call
+  parser generation (e.g. a template `raise_exception`), `callUpstream()` retries
+  the call once **without** tools rather than failing the round — degrading to a
+  plain completion instead of an error.
+- **Backend auto-restart** — when the launcher owns the model process and it exits
+  unexpectedly (backend crash, OOM, template abort), it is respawned with
+  exponential backoff (1s→30s, reset after the process stays healthy >30s). A
+  deliberate stop/switch/shutdown is never auto-restarted.
+- **Survives terminal disconnect** — the harness ignores `SIGHUP` and spawns the
+  model detached (its own process group), so a controlling-terminal / SSH
+  disconnect takes down neither the harness nor the expensive-to-reload model.
+  `SIGINT`/`SIGTERM` still perform a clean shutdown (killing the model process).
 
 ---
 
@@ -375,7 +539,10 @@ npm test
 | `test/e2e_chat.js` | Full chat request through harness to mock LLM |
 | `test/e2e_ui.js` | UI icon registry (registration, action execution, guards) |
 | `test/e2e_music.js` | Music plugin: library walking, playlists, browsing, searching, streaming, queue, route mounting, host header handling |
-| `test/compaction.js` | Conversation compaction logic |
+| `test/compaction.js` | Conversation compaction logic (incl. always keeping a `user` turn) |
+| `test/tool-fallback.js` | Retry without tools on a tool-parser `400` |
+| `test/auto-restart.js` | Backend crash → auto-restart; intentional stop stays down |
+| `test/model-launcher.js` | Launcher script parsing, start/stop/switch, model HTTP routes |
 | `test/sse-robustness.js` | SSE stream resilience |
 | `test/upstream-metrics.js` | Upstream metrics proxy |
 | `test/metrics.js` | Global metrics tracking |

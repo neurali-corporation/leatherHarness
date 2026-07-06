@@ -88,6 +88,28 @@ const C = {
   danger:       '#cc3344',
 };
 
+// How hard the model should "think" before answering. Mapped to request params in
+// thinkingParams() and forwarded verbatim to the upstream by resolveRequest().
+type ThinkLevel = 'off' | 'low' | 'medium' | 'high';
+const THINK_KEY = 'leather.thinking';
+const THINK_LABELS: Record<ThinkLevel, string> = { off: 'Off', low: 'Low', medium: 'Med', high: 'High' };
+
+function loadThinkLevel(): ThinkLevel {
+  const v = (typeof localStorage !== 'undefined' && localStorage.getItem(THINK_KEY)) as ThinkLevel | null;
+  return v === 'off' || v === 'low' || v === 'medium' || v === 'high' ? v : 'medium';
+}
+
+// Both fields are sent so either model family honors the choice: OpenAI/GPT-OSS-style
+// models read `reasoning_effort`; Qwen3-style templates (Ornith) read
+// `chat_template_kwargs.enable_thinking`. Fields a model doesn't understand are
+// harmless. "off" disables thinking outright.
+function thinkingParams(level: ThinkLevel): Record<string, unknown> {
+  if (level === 'off') {
+    return { reasoning_effort: 'none', chat_template_kwargs: { enable_thinking: false } };
+  }
+  return { reasoning_effort: level, chat_template_kwargs: { enable_thinking: true } };
+}
+
 export default function App() {
   const [sessions,    setSessions]    = useState<Record<string, Session>>({});
   const [currentId,   setCurrentId]   = useState<string | null>(null);
@@ -98,6 +120,7 @@ export default function App() {
   const [pluginIcons, setPluginIcons] = useState<{ id: string; title: string; icon: string }[]>([]);
   const [toast,       setToast]       = useState<string | null>(null);
   const [openPlugin,  setOpenPlugin]  = useState<string | null>(null);
+  const [thinking,    setThinking]    = useState<ThinkLevel>(loadThinkLevel);
 
   // Plugins can contribute clickable icons to the UI via the ui-registry.
   useEffect(() => {
@@ -252,7 +275,7 @@ export default function App() {
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Leather-UI': '1' },
-        body: JSON.stringify({ model: 'any', messages: apiMsgs, stream: true }),
+        body: JSON.stringify({ model: 'any', messages: apiMsgs, stream: true, ...thinkingParams(thinking) }),
         signal: controller.signal,
       });
 
@@ -532,8 +555,15 @@ export default function App() {
         </div>
       )}
 
-      {/* Model switcher */}
-      <ModelSwitcher />
+      {/* Thinking amount + model switcher */}
+      <ThinkingSelector
+        value={thinking}
+        onChange={(v) => {
+          setThinking(v);
+          try { localStorage.setItem(THINK_KEY, v); } catch { /* ignore */ }
+        }}
+      />
+      <ModelSwitcher setToast={setToast} />
 
       {/* Global metrics panel */}
       <GlobalMetricsPanel />
@@ -765,7 +795,7 @@ export default function App() {
   );
 }
 
-function ModelSwitcher() {
+function ModelSwitcher({ setToast }: { setToast: (msg: string | null) => void }) {
   const [status, setStatus] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -881,7 +911,7 @@ function ModelSwitcher() {
           </div>
         )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 }}>
-          {status.models.map(model => (
+          {status.models.map((model: any) => (
             <button
               key={model.name}
               onClick={() => handleSwitch(model.name)}
@@ -902,6 +932,43 @@ function ModelSwitcher() {
             </button>
           ))}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ThinkingSelector({ value, onChange }: { value: ThinkLevel; onChange: (v: ThinkLevel) => void }) {
+  const levels: ThinkLevel[] = ['off', 'low', 'medium', 'high'];
+  return (
+    <div style={{
+      flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '8px 10px',
+      fontSize: 11, color: C.muted,
+    }}>
+      <div style={{ fontWeight: 500, marginBottom: 4, color: C.text }}>Thinking</div>
+      <div style={{ display: 'flex', gap: 2 }}>
+        {levels.map(l => {
+          const active = value === l;
+          return (
+            <button
+              key={l}
+              onClick={() => onChange(l)}
+              title={`Thinking: ${THINK_LABELS[l]}`}
+              style={{
+                flex: 1,
+                background: active ? C.accentDim : C.surface2,
+                border: `1px solid ${active ? C.accentBorder : C.border}`,
+                color: active ? C.accent : C.text,
+                borderRadius: 4,
+                padding: '4px 0',
+                cursor: active ? 'default' : 'pointer',
+                fontSize: 10,
+                fontWeight: active ? 600 : 400,
+              }}
+            >
+              {THINK_LABELS[l]}
+            </button>
+          );
+        })}
       </div>
     </div>
   );

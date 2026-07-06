@@ -9,8 +9,12 @@ export function startMockLlama(port, responseGenerator) {
       for await (const chunk of req) body += chunk;
       const reqJson = JSON.parse(body);
       const resp = responseGenerator(reqJson);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(resp));
+      // A generator may override the HTTP status (e.g. simulate a 400) by
+      // returning { __status, __body }; otherwise the value is the 200 JSON body.
+      const status = resp && resp.__status ? resp.__status : 200;
+      const bodyObj = resp && resp.__body !== undefined ? resp.__body : resp;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(bodyObj));
     } else {
       res.writeHead(404);
       res.end();

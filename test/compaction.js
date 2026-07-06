@@ -210,10 +210,56 @@ async function testCompactionPreservesRecentMessages() {
   server.close();
 }
 
+// ── testCompactionKeepsUserTurn: post-compaction payloads always carry a user turn ──
+// Regression guard: Qwen3-style templates (Ornith) raise "No user query found in
+// messages." during llama.cpp --jinja tool-parser generation when a request has no
+// user role. Compaction used to strip the original user request into the summarized
+// half, leaving a user-less tail → upstream 400. Every upstream call must see a user.
+async function testCompactionKeepsUserTurn() {
+  let sawCompactedRequest = false;
+  let userlessRequest = null;
+  const mockPort = 12354;
+  const server = await startMockLlama(mockPort, (req) => {
+    const hasCompact = req.messages.some(
+      m => m.role === 'system' && typeof m.content === 'string' && m.content.includes('Compacted Conversation Summary')
+    );
+    if (hasCompact) sawCompactedRequest = true;
+    if (!req.messages.some(m => m.role === 'user')) {
+      userlessRequest = req.messages.map(m => m.role);
+    }
+    // Keep returning tool calls so compaction is forced to run.
+    return {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "1", type: "function", function: { name: "hx__clock", arguments: "{}" } }],
+        },
+      }],
+    };
+  });
+
+  const cfg = {
+    upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` },
+    maxToolRounds: 20,
+    maxMessages: 10,
+  };
+  const body = { messages: [{ role: "user", content: "What time is it?" }], tools: [] };
+
+  try {
+    await resolveRequest(body, cfg, () => {});
+  } catch (_) {}
+
+  assert.ok(sawCompactedRequest, "compaction should have been triggered");
+  assert.equal(userlessRequest, null, `every upstream payload must contain a user turn, saw roles: ${JSON.stringify(userlessRequest)}`);
+  server.close();
+}
+
 (async () => {
   await testCompactionTriggers();
   await testNoCompactionWhenBelowThreshold();
   await testCompactionWithStreaming();
   await testCompactionPreservesRecentMessages();
+  await testCompactionKeepsUserTurn();
   console.log("All compaction tests passed");
 })();
