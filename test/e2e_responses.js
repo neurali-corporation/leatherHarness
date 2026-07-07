@@ -16,6 +16,12 @@ async function startMockLlama(port) {
       let body = '';
       for await (const chunk of req) body += chunk;
       const json = JSON.parse(body);
+      // "slow" requests stall so the test can hang up the client mid-flight and
+      // confirm the harness survives the disconnect instead of crashing.
+      const lastUser = [...(json.messages || [])].reverse().find(m => m.role === 'user');
+      if (typeof lastUser?.content === 'string' && lastUser.content.includes('slow')) {
+        await delay(1500);
+      }
       const clientToolNames = (json.tools || [])
         .map(t => t.function?.name)
         .filter(n => n && !n.startsWith('hx__'));
@@ -126,6 +132,23 @@ const globTool = { type: 'function', name: 'glob', description: 'find files', pa
     const textItem = (followData.output || []).find(o => o.type === 'message');
     assert.ok(textItem && textItem.content?.[0]?.text === 'done', 'round-trip: expected text answer after tool result');
     console.log('✅ /responses tool-result round-trip completes');
+
+    // ── Client disconnect mid-stream must NOT crash the harness ──
+    const ac = new AbortController();
+    const aborting = fetch(`http://127.0.0.1:${harnessPort}/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'any', stream: true, input: [{ role: 'user', content: 'slow please' }], tools: [globTool] }),
+      signal: ac.signal,
+    }).catch(() => { /* abort rejects the fetch — expected */ });
+    await delay(300);
+    ac.abort(); // hang up while the upstream is still "generating"
+    await aborting;
+    await delay(500);
+    // If the process died, this request throws/never connects.
+    const alive = await fetch(`http://127.0.0.1:${harnessPort}/api/metrics`);
+    assert.strictEqual(alive.status, 200, 'harness should survive a client disconnect');
+    console.log('✅ Harness survives client disconnect mid-stream');
 
     console.log('✅ All /responses tests passed');
   } finally {

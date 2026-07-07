@@ -10,6 +10,12 @@ import { matchRoute } from './http-registry.ts';
 import { setListen, noteHost } from './runtime.ts';
 import { uiIconList, runUiIcon } from './ui-registry.ts';
 import { initModelLauncher, resetModelLauncher } from './model-launcher.ts';
+import { logError, installGlobalErrorHandlers } from './log.ts';
+
+// Catch anything that escapes a handler (unhandled rejection, uncaught
+// exception, stray socket 'error') and log a full stack instead of dying
+// silently. Installed at module load so it's active before the server starts.
+installGlobalErrorHandlers();
 
 // ── OpenAI Responses API ↔ chat/completions translation ─────────────────────
 // OMP (and other newer clients) speak the Responses API instead of
@@ -225,7 +231,7 @@ async function main() {
     await getModelLauncher()?.autoStart();
   }
 
-  const server = http.createServer(async (req, res) => {
+  const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     // TEMP debug: log every incoming request to spot unhandled routes (e.g. OMP title-generator).
     console.log(`➡️  ${req.method} ${req.url}  auth=${req.headers.authorization ? 'yes' : 'no'}  accept=${req.headers.accept ?? ''}`);
     // Remember the address the browser reaches us at, so tool links use it.
@@ -301,7 +307,7 @@ async function main() {
       try {
         await route(req, res);
       } catch (e) {
-        console.error('❌ route handler error:', e);
+        logError('route handler', e);
         if (!res.headersSent) res.writeHead(500);
         res.end('error');
       }
@@ -389,7 +395,8 @@ async function main() {
         const uiEmit = (ev: object) => {
           trackMetrics(ev as any);
           if (!res.writableEnded && res.writable) {
-            res.write(`data: ${JSON.stringify(ev)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(ev)}\n\n`); }
+            catch (e) { logError(`chat UI stream write (t=${(ev as any)?.t})`, e); }
           }
         };
 
@@ -407,7 +414,8 @@ async function main() {
             model,
             choices: [{ index: 0, delta, finish_reason: finish }],
           };
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          try { res.write(`data: ${JSON.stringify(chunk)}\n\n`); }
+          catch (e) { logError('chat OpenAI stream write', e); }
         };
         const openaiEmit = (ev: object) => {
           const e = ev as any;
@@ -447,7 +455,7 @@ async function main() {
         try {
           await resolveRequest(json, config, emitFn);
         } catch (e: any) {
-          console.error('❌ resolveRequest error:', e);
+          logError('resolveRequest (chat/completions, streaming)', e);
           // Only emit error/done if response is still open
           if (!res.writableEnded && res.writable) {
             emitFn({ t: 'error', message: e.message });
@@ -470,7 +478,7 @@ async function main() {
       try {
         result = await resolveRequest(json, config);
       } catch (e) {
-        console.error('❌ resolveRequest error:', e);
+        logError('resolveRequest (chat/completions, non-streaming)', e);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'Internal server error' } }));
         return;
@@ -508,7 +516,11 @@ async function main() {
         let seq = 0;
         const send = (type: string, payload: object) => {
           if (res.writableEnded || !res.writable) return;
-          res.write(`data: ${JSON.stringify({ type, sequence_number: seq++, ...payload })}\n\n`);
+          try {
+            res.write(`data: ${JSON.stringify({ type, sequence_number: seq++, ...payload })}\n\n`);
+          } catch (e) {
+            logError(`/responses stream write (type=${type})`, e);
+          }
         };
         const baseResponse = (status: string) => ({
           id: respId, object: 'response', created_at: created, status, model,
@@ -557,7 +569,7 @@ async function main() {
         try {
           await resolveRequest(chatBody, config, emit);
         } catch (e: any) {
-          console.error('❌ resolveRequest error (/responses):', e);
+          logError('resolveRequest (/responses, streaming)', e);
           if (!res.writableEnded && res.writable) {
             send('response.error', { message: e.message });
             send('response.failed', { response: baseResponse('failed') });
@@ -606,7 +618,7 @@ async function main() {
       try {
         result = await resolveRequest(chatBody, config);
       } catch (e) {
-        console.error('❌ resolveRequest error (/responses):', e);
+        logError('resolveRequest (/responses, non-streaming)', e);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'Internal server error' } }));
         return;
@@ -825,7 +837,7 @@ async function main() {
           }
         }
       } catch (e: any) {
-        console.error('❌ Upstream metrics fetch error:', e);
+        logError('upstream metrics fetch', e);
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `Failed to fetch upstream metrics: ${e.message}` }));
       }
@@ -926,6 +938,23 @@ async function main() {
 
     res.writeHead(404);
     res.end();
+  };
+
+  const server = http.createServer((req, res) => {
+    // A client hanging up mid-stream makes the socket emit 'error'; with no
+    // listener that becomes an uncaught exception and kills the process. Catch
+    // it here (and on the request stream) so a disconnect is just a log line.
+    req.on('error', (e) => logError(`request stream ${req.method} ${req.url}`, e));
+    res.on('error', (e) => logError(`response stream ${req.method} ${req.url}`, e));
+    // Any rejection escaping the async handler lands here with a full stack,
+    // and the caller still gets a 500 rather than a dropped connection.
+    handleRequest(req, res).catch((e) => {
+      logError(`unhandled in request ${req.method} ${req.url}`, e);
+      try {
+        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+        if (!res.writableEnded) res.end(JSON.stringify({ error: { message: 'internal server error' } }));
+      } catch (e2) { logError('failed to send 500 response', e2); }
+    });
   });
 
   const port = process.env.PORT ? parseInt(process.env.PORT) : config.listen.port;
@@ -935,4 +964,4 @@ async function main() {
   });
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => { logError('fatal: main() failed to start', e); process.exit(1); });

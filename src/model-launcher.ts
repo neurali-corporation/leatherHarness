@@ -26,18 +26,32 @@ function extractPort(args: string[]): number {
  * the port, which would make the new instance fail with EADDRINUSE
  * ("couldn't bind HTTP server socket").
  */
-async function freePort(port: number): Promise<void> {
-  let pids: string[] = [];
+/**
+ * PIDs *listening* on the port. Critically we must use `-sTCP:LISTEN`: a bare
+ * `lsof -ti tcp:PORT` also returns every process merely *connected* to the port,
+ * which includes THIS harness — it opens client connections to llama.cpp on
+ * 9001 for chat completions and for polling `/metrics`. freePort() SIGTERM/
+ * SIGKILLs whatever this returns, so without the LISTEN filter it would take
+ * down llama.cpp *and* the harness itself (the harness's SIGTERM handler calls
+ * process.exit). Only a listening socket blocks a new bind anyway. As a second
+ * guard we never return our own pid.
+ */
+async function listenersOnPort(port: number): Promise<string[]> {
   try {
-    const { stdout } = await execFileP('lsof', ['-ti', `tcp:${port}`]);
-    pids = stdout.split('\n').map(s => s.trim()).filter(Boolean);
+    const { stdout } = await execFileP('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']);
+    return stdout.split('\n').map(s => s.trim()).filter(Boolean)
+      .filter(pid => Number(pid) !== process.pid);
   } catch {
     // lsof exits non-zero when nothing is listening (or isn't installed) — nothing to free.
-    return;
+    return [];
   }
+}
+
+async function freePort(port: number): Promise<void> {
+  let pids = await listenersOnPort(port);
   if (pids.length === 0) return;
 
-  console.warn(`⚠️  Port ${port} held by stale process(es) ${pids.join(', ')}; terminating before launch`);
+  console.warn(`⚠️  Port ${port} held by stale listener(s) ${pids.join(', ')}; terminating before launch`);
   for (const pid of pids) {
     try { process.kill(Number(pid), 'SIGTERM'); } catch {}
   }
@@ -45,13 +59,7 @@ async function freePort(port: number): Promise<void> {
   // Wait up to ~5s for the port to be released, escalating to SIGKILL halfway.
   for (let attempt = 0; attempt < 50; attempt++) {
     await new Promise(r => setTimeout(r, 100));
-    let still: string[] = [];
-    try {
-      const { stdout } = await execFileP('lsof', ['-ti', `tcp:${port}`]);
-      still = stdout.split('\n').map(s => s.trim()).filter(Boolean);
-    } catch {
-      return; // port free
-    }
+    const still = await listenersOnPort(port);
     if (still.length === 0) return;
     if (attempt === 25) {
       for (const pid of still) {

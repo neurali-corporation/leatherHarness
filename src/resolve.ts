@@ -3,6 +3,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { resolve as resolvePath, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { hasTool, getTool, toolSchemas } from './registry.ts';
+import { logError } from './log.ts';
 
 // At startup only the MAIN memo is injected into context. If sub-memos exist
 // (other `.md` files in the same directory), we append a one-line mention of
@@ -120,6 +121,7 @@ async function callUpstream(url: string, payload: object): Promise<UpstreamResul
       const isConnectionError = e.code === 'ECONNREFUSED' || e.code === 'ENOTFOUND' || e.code === 'ETIMEDOUT' || e.cause?.code === 'ECONNREFUSED';
       const backoffMs = isConnectionError ? Math.min(1000 * Math.pow(2, attempt - 1), 30000) : 500 * attempt;
       console.warn(`⚠️  Upstream attempt ${attempt}/${maxAttempts} failed: ${lastErr}`);
+      logError(`callUpstream attempt ${attempt}/${maxAttempts}`, e);
       if (attempt < maxAttempts) await delay(backoffMs);
     }
   }
@@ -184,6 +186,7 @@ async function compactMessages(
     }
   } catch (e) {
     console.warn('⚠️  Compaction failed:', e);
+    logError('compactMessages', e);
   }
 
   // If compaction fails, just truncate without summary
@@ -323,6 +326,7 @@ export async function resolveRequest(body: any, config: any, emit?: Emit): Promi
         // Never let a tool failure kill the loop — feed the error back so the model can recover.
         out = `ERROR: ${tc.function.name} failed: ${describeError(e)}`;
         console.warn(`⚠️  Tool ${tc.function.name} threw: ${out}`);
+        logError(`tool ${tc.function.name}`, e);
       }
 
       console.log(`✅ ${tc.function.name} →`, out.slice(0, 80));
