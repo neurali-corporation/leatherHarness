@@ -73,8 +73,9 @@ async function testStartupTemplating() {
       'env placeholder left untouched',
     );
 
-    // Plugins with settings get their own config file templated from defaultConfig.
-    const searchCfg = JSON.parse(await readFile(join(dir, 'search', 'config.json'), 'utf8'));
+    // Plugins with settings get their own config file templated from defaultConfig,
+    // under the app-assigned `plugins/<name>/` directory.
+    const searchCfg = JSON.parse(await readFile(join(dir, 'plugins', 'search', 'config.json'), 'utf8'));
     assert.deepEqual(
       Object.keys(searchCfg).sort(),
       ['exa', 'jina', 'tavily'],

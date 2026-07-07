@@ -9,15 +9,16 @@ import { hasTool, getTool, toolSchemas } from './registry.ts';
 // their names so the model knows it can pull them in via read_memo on demand.
 async function readMemoContent(config: any): Promise<string> {
   const memoDir = resolvePath(homedir(), '.config/leatherHarness/plugins/memo');
+  const mainMemoFile = 'memo.md';
 
   let main = '';
-  try { main = await readFile(memoDir, 'utf8'); } catch (_) {}
+  try { main = await readFile(resolvePath(memoDir, mainMemoFile), 'utf8'); } catch (_) {}
 
   let subs: string[] = [];
   try {
     const entries = await readdir(memoDir);
     subs = entries
-      .filter(f => f.endsWith('.md'))
+      .filter(f => f.endsWith('.md') && f !== mainMemoFile)
       .map(f => f.slice(0, -3))
       .sort();
   } catch (_) {}

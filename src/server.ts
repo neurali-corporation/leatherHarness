@@ -346,12 +346,32 @@ async function main() {
       return;
     }
 
-    if (req.method === 'GET' && req.url === '/v1/models') {
-      const upstream = config.upstream.baseUrl + '/models';
-      const resp = await fetch(upstream);
-      const data = await resp.json();
-      res.writeHead(resp.status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(data));
+    // OpenAI-compatible model discovery. The harness offers no model selection —
+    // it forwards to a single upstream — so this returns only the model actually
+    // running (what llama.cpp reports at /v1/models), as a single-entry list.
+    if (req.method === 'GET' && pathname === '/v1/models') {
+      const empty = { object: 'list', data: [] as unknown[] };
+      // When we manage the launcher and nothing is running, upstream is down;
+      // return an empty list instead of erroring so clients degrade gracefully.
+      if (config.enableModelLauncher) {
+        const { getModelLauncher } = await import('./model-launcher.ts');
+        const launcher = getModelLauncher();
+        if (launcher && !launcher.getStatus().isRunning) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(empty));
+          return;
+        }
+      }
+      try {
+        const resp = await fetch(config.upstream.baseUrl + '/models');
+        const data = await resp.json();
+        res.writeHead(resp.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(data));
+      } catch {
+        // Upstream unreachable — treat as "no model running".
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(empty));
+      }
       return;
     }
 

@@ -8,7 +8,6 @@ import { createReadStream, statSync } from 'node:fs';
 import { stat, readdir, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { resolve as resolvePath, extname, basename, dirname, sep, join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { homedir } from 'node:os';
 
 // Path the player UI + streaming routes are mounted at on the main harness server.
 const MOUNT = '/api/plugin/music';
@@ -54,7 +53,9 @@ export interface Playlist {
   tracks: string[];  // absolute file paths
 }
 
-const PLAYLISTS_DIR = join(homedir(), '.config/leatherHarness/plugins/music/playlists');
+// Set by setup() from the directory the app assigns this plugin (cfg.dir) — we
+// don't decide our own absolute path. Playlists live under `<plugin dir>/playlists`.
+let PLAYLISTS_DIR = '';
 
 async function ensurePlaylistsDir(): Promise<void> {
   await mkdir(PLAYLISTS_DIR, { recursive: true });
@@ -944,6 +945,8 @@ $('seek').addEventListener('input', (e) => { if (audio.duration) audio.currentTi
 let routeRegistered = false;
 
 export function setup(cfg: PluginConfig<MusicConfig>) {
+  PLAYLISTS_DIR = join(cfg.dir, 'playlists');
+
   async function dirs(): Promise<string[]> {
     const { allowedDirs = [] } = await cfg.get();
     return allowedDirs.map((d) => resolvePath(d));

@@ -6,6 +6,15 @@ import { existsSync } from 'node:fs';
 export interface PluginConfig<T extends object = Record<string, unknown>> {
   get(): Promise<T>;
   set(patch: Partial<T>): Promise<void>;
+  /**
+   * The plugin's own directory, assigned by the app from the plugin's name
+   * (`<config>/plugins/<name>`). Plugins persist all their files here rather
+   * than deciding an absolute path themselves. The directory is created lazily;
+   * call `ensureDir()` (or write through a helper that does) before writing.
+   */
+  readonly dir: string;
+  /** Create the plugin's `dir` if it doesn't exist yet, and return it. */
+  ensureDir(): Promise<string>;
 }
 
 // Default llama-server launch commands written into a fresh config so the
@@ -352,10 +361,18 @@ function applyEnv(raw: string): string {
 }
 
 function makePluginConfig<T extends object>(name: string, cfgPath: string): PluginConfig<T> {
-  const pluginConfigDir = dirname(cfgPath);
-  const pluginConfigPath = join(pluginConfigDir, name, 'config.json');
+  // Every plugin lives under `<config>/plugins/<name>`: both its config.json and
+  // any data it persists. The app derives this from the plugin's name so plugins
+  // never choose their own absolute paths.
+  const pluginDir = join(dirname(cfgPath), 'plugins', name);
+  const pluginConfigPath = join(pluginDir, 'config.json');
 
   return {
+    dir: pluginDir,
+    async ensureDir(): Promise<string> {
+      await mkdir(pluginDir, { recursive: true });
+      return pluginDir;
+    },
     async get(): Promise<T> {
       try {
         const raw = await readFile(pluginConfigPath, 'utf8');
@@ -413,7 +430,7 @@ export async function loadPlugins(pluginsDir: string, cfgPath: string): Promise<
   // Reset per-plugin discovery so repeated loads (e.g. in tests) don't accumulate.
   pluginDiscovery.length = 0;
 
-  const configDirForPlugins = dirname(cfgPath);
+  const configDirForPlugins = join(dirname(cfgPath), 'plugins');
   const loaded: string[] = [];
   const failed: string[] = [];
 

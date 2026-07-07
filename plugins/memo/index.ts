@@ -1,61 +1,44 @@
 import { registerNativeTool } from '../../src/registry.ts';
 import type { PluginConfig } from '../../src/plugin-loader.ts';
-import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
-import { dirname, join, basename } from 'node:path';
-import { homedir } from 'node:os';
+import { readFile, writeFile, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 
-interface MemoConfig {
-  path?: string;
-}
-
-export const defaultConfig: MemoConfig = {
-  path: '~/.config/leatherHarness/memo',
-};
+// The main memo is stored as `memo.md`; sub-memos live beside it as `<name>.md`.
+const MAIN_MEMO_FILE = 'memo.md';
 
 // Sub-memo file names are sanitized to a safe basename; they live alongside the
-// main memo as `<name>.md` so the whole memo store is one flat directory.
+// main memo in the plugin's own directory so the whole memo store is one place.
 function sanitizeName(name: string): string {
   const safe = name.trim().replace(/[^A-Za-z0-9 _-]+/g, '-').replace(/^-+|-+$/g, '');
   return safe || 'untitled';
 }
 
-export function setup(cfg: PluginConfig<MemoConfig>) {
-  async function mainMemoPath(): Promise<string> {
-    const { path: p } = await cfg.get();
-    if (p) return p.replace(/^~/, homedir());
-    return `${homedir()}/.config/leatherHarness/plugins/memo`;
-  }
-
-  // Resolve the target file: the main memo when no name is given, else a sub-memo
-  // stored as `<name>.md` in the same directory as the main memo.
-  async function targetPath(name?: string): Promise<string> {
-    if (name && name.trim()) {
-      return join(dirname(await mainMemoPath()), `${sanitizeName(name)}.md`);
-    }
-    return mainMemoPath();
+export function setup(cfg: PluginConfig) {
+  // The plugin's storage directory is assigned by the app from our name; we
+  // never decide an absolute path ourselves.
+  function targetPath(name?: string): string {
+    const file = name && name.trim() ? `${sanitizeName(name)}.md` : MAIN_MEMO_FILE;
+    return join(cfg.dir, file);
   }
 
   async function readMemo(name?: string): Promise<string> {
-    try { return await readFile(await targetPath(name), 'utf8'); }
+    try { return await readFile(targetPath(name), 'utf8'); }
     catch (_) { return ''; }
   }
 
   // The memo is stored and read back as Markdown — write tools should pass
   // Markdown-formatted content (headings, lists, etc.) so it renders cleanly.
   async function writeMemo(content: string, name?: string): Promise<void> {
-    const p = await targetPath(name);
-    await mkdir(dirname(p), { recursive: true });
-    await writeFile(p, content, 'utf8');
+    await cfg.ensureDir();
+    await writeFile(targetPath(name), content, 'utf8');
   }
 
   // Names of all sub-memos (the `.md` files beside the main memo, main excluded).
   async function listSubMemos(): Promise<string[]> {
-    const main = await mainMemoPath();
     try {
-      const entries = await readdir(dirname(main));
-      const mainBase = basename(main);
+      const entries = await readdir(cfg.dir);
       return entries
-        .filter(f => f.endsWith('.md') && f !== mainBase)
+        .filter(f => f.endsWith('.md') && f !== MAIN_MEMO_FILE)
         .map(f => f.slice(0, -3))
         .sort();
     } catch (_) { return []; }
