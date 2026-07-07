@@ -162,6 +162,8 @@ async function main() {
   }
 
   const server = http.createServer(async (req, res) => {
+    // TEMP debug: log every incoming request to spot unhandled routes (e.g. OMP title-generator).
+    console.log(`➡️  ${req.method} ${req.url}  auth=${req.headers.authorization ? 'yes' : 'no'}  accept=${req.headers.accept ?? ''}`);
     // Remember the address the browser reaches us at, so tool links use it.
     noteHost(req.headers.host);
 
