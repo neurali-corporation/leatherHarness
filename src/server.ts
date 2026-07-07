@@ -522,11 +522,27 @@ async function main() {
 
         let text = '';
         let usage: any = {};
+        // Client (foreign) tool calls the model wants executed. These are NOT
+        // harness-internal — they belong to the caller (e.g. opencode's task/glob/
+        // read) and must be forwarded as Responses `function_call` output items,
+        // or the agent loop stalls with nothing to run. Collected here and streamed
+        // after the text message item is finalized (see below).
+        const functionCalls: Array<{ id: string; call_id: string; name: string; arguments: string }> = [];
         const emit = (ev: object) => {
           const e = ev as any;
           switch (e.t) {
             case 'delta':
               if (e.text) { text += e.text; send('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: e.text }); }
+              break;
+            case 'tool_calls':
+              for (const c of (e.calls ?? [])) {
+                functionCalls.push({
+                  id: 'fc_' + Math.random().toString(36).slice(2),
+                  call_id: c.id,
+                  name: c.function?.name,
+                  arguments: c.function?.arguments ?? '',
+                });
+              }
               break;
             case 'done':
               usage = e.usage ?? {};
@@ -534,7 +550,7 @@ async function main() {
             case 'error':
               send('response.error', { message: e.message });
               break;
-            // reasoning / tool_calls / metrics are harness-internal — suppressed.
+            // reasoning / metrics are harness-internal — suppressed.
           }
         };
 
@@ -560,8 +576,24 @@ async function main() {
           send('response.output_text.done', { item_id: msgId, output_index: 0, content_index: 0, text });
           send('response.content_part.done', { item_id: msgId, output_index: 0, content_index: 0, part: finalContent[0] });
           send('response.output_item.done', { output_index: 0, item: { ...item, status: 'completed', content: finalContent } });
+
+          // Stream any client tool calls as function_call output items (indices
+          // after the text message at 0) so the caller receives and executes them.
+          const outputItems: unknown[] = [{ ...item, status: 'completed', content: finalContent }];
+          let outputIndex = 1;
+          for (const fc of functionCalls) {
+            const fcItem = { id: fc.id, type: 'function_call', status: 'in_progress', call_id: fc.call_id, name: fc.name, arguments: '' };
+            send('response.output_item.added', { output_index: outputIndex, item: fcItem });
+            if (fc.arguments) send('response.function_call_arguments.delta', { item_id: fc.id, output_index: outputIndex, delta: fc.arguments });
+            send('response.function_call_arguments.done', { item_id: fc.id, output_index: outputIndex, arguments: fc.arguments });
+            const fcDone = { ...fcItem, status: 'completed', arguments: fc.arguments };
+            send('response.output_item.done', { output_index: outputIndex, item: fcDone });
+            outputItems.push(fcDone);
+            outputIndex++;
+          }
+
           const done = baseResponse('completed');
-          done.output = [{ ...item, status: 'completed', content: finalContent }];
+          done.output = outputItems;
           done.usage = usageOut;
           send('response.completed', { response: done });
           res.end();
@@ -584,12 +616,24 @@ async function main() {
         res.end(JSON.stringify({ error: result.error }));
         return;
       }
-      const text = result?.choices?.[0]?.message?.content ?? '';
+      const respMsg = result?.choices?.[0]?.message ?? {};
+      const text = respMsg.content ?? '';
+      const toolCalls = respMsg.tool_calls ?? [];
       const usage = result?.usage ?? {};
+      // Emit the text message (unless the turn is a pure tool call), then forward
+      // any client tool calls as function_call output items so the caller runs them.
+      const output: unknown[] = [];
+      if (text || toolCalls.length === 0) {
+        output.push({ id: msgId, type: 'message', status: 'completed', role: 'assistant',
+          content: [{ type: 'output_text', text, annotations: [] }] });
+      }
+      for (const c of toolCalls) {
+        output.push({ id: 'fc_' + Math.random().toString(36).slice(2), type: 'function_call',
+          status: 'completed', call_id: c.id, name: c.function?.name, arguments: c.function?.arguments ?? '' });
+      }
       const responseObj = {
         id: respId, object: 'response', created_at: created, status: 'completed', model,
-        output: [{ id: msgId, type: 'message', status: 'completed', role: 'assistant',
-          content: [{ type: 'output_text', text, annotations: [] }] }],
+        output,
         usage: {
           input_tokens: usage.prompt_tokens ?? 0,
           output_tokens: usage.completion_tokens ?? 0,
