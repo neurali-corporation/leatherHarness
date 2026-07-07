@@ -284,7 +284,7 @@ async function main() {
       } catch { /* fall through */ }
     }
 
-    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+    if (req.method === 'POST' && (pathname === '/v1/chat/completions' || pathname === '/chat/completions')) {
       let body = '';
       for await (const chunk of req) body += chunk;
       const json = JSON.parse(body);
@@ -436,7 +436,7 @@ async function main() {
     // OpenAI-compatible model discovery. The harness offers no model selection —
     // it forwards to a single upstream — so this returns only the model actually
     // running (what llama.cpp reports at /v1/models), as a single-entry list.
-    if (req.method === 'GET' && pathname === '/v1/models') {
+    if (req.method === 'GET' && (pathname === '/v1/models' || pathname === '/models')) {
       const empty = { object: 'list', data: [] as unknown[] };
       // When we manage the launcher and nothing is running, upstream is down;
       // return an empty list instead of erroring so clients degrade gracefully.
