@@ -239,15 +239,110 @@ export function stringifyConfig(cfg: unknown): string {
   return JSON.stringify(cfg, null, 2);
 }
 
-const BASE_CONFIG = {
-  listen:             { host: '127.0.0.1', port: 8080 },
-  upstream:           { baseUrl: '${OPENCODE_ENDPOINT:-http://127.0.0.1:9001/v1}' },
-  maxToolRounds:      25,
-  mcpServers:         {},
-  pluginsDir:         './plugins',
+// The full application-level config template. Every field the harness reads is
+// listed here with a sensible empty/default placeholder so a freshly generated
+// config.json documents all available settings, and so existing configs get any
+// newly added field back-filled on startup (see fillDefaults / loadPlugins).
+//   - "" / null  → an optional value that is off/unset by default
+//   - []/{}       → an empty collection
+//   - concrete    → a working default (ports, thresholds, bundled models)
+export const BASE_CONFIG = {
+  listen:              { host: '127.0.0.1', port: 8080 },
+  upstream:            { baseUrl: '${OPENCODE_ENDPOINT:-http://127.0.0.1:9001/v1}' },
+  secret:              '',            // shared secret / Bearer token; "" disables auth
+  maxToolRounds:       25,
+  maxMessages:         50,            // conversation length before compaction kicks in
+  mcpServers:          {},
+  pluginsDir:          './plugins',
   enableModelLauncher: true,
-  models:             DEFAULT_MODELS,
+  launchersDir:        '',            // "" → auto-discover from ../launchers
+  models:              DEFAULT_MODELS,
 };
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Back-fill missing config fields from a template. Every key present in
+ * `template` is guaranteed to exist in the result: an existing value always
+ * wins (recursing into nested plain objects), and anything absent is filled
+ * from the template. Arrays and scalars are treated as atomic — we never merge
+ * into a user's array or overwrite a value they already set. Returns the merged
+ * object plus whether any key had to be added, so callers can skip rewriting an
+ * already-complete file.
+ */
+export function fillDefaults(existing: unknown, template: unknown): { value: unknown; changed: boolean } {
+  if (!isPlainObject(template)) {
+    return existing === undefined ? { value: template, changed: true } : { value: existing, changed: false };
+  }
+  const src = isPlainObject(existing) ? existing : {};
+  const out: Record<string, unknown> = { ...src };
+  // If the slot was missing (or held a non-object) we're synthesising the whole
+  // object from the template, which is itself a change.
+  let changed = !isPlainObject(existing);
+  for (const [key, tmplVal] of Object.entries(template)) {
+    const res = fillDefaults(src[key], tmplVal);
+    out[key] = res.value;
+    if (res.changed) changed = true;
+  }
+  return { value: out, changed };
+}
+
+// ── discovery registry ──────────────────────────────────────────────────────
+// Populated while loadPlugins runs so the /api/discovery endpoint can report
+// every configurable surface: the application settings and each plugin's config
+// schema (its defaultConfig), with the on-disk path each lives at.
+export interface PluginDiscovery {
+  name: string;
+  defaults: Record<string, unknown>;
+  configPath: string;
+  loaded: boolean;
+}
+
+let applicationDiscovery: { defaults: Record<string, unknown>; configPath: string } | null = null;
+const pluginDiscovery: PluginDiscovery[] = [];
+
+export function getDiscovery(): {
+  application: { defaults: Record<string, unknown>; configPath: string } | null;
+  plugins: PluginDiscovery[];
+} {
+  return { application: applicationDiscovery, plugins: pluginDiscovery };
+}
+
+/**
+ * Merge a template into a JSON config file on disk, writing it back only when a
+ * field was missing (or the file didn't exist). Reads the raw file — env-var
+ * placeholders like "${VAR:-default}" are left untouched so we don't bake
+ * resolved values into the config. Returns the merged config object.
+ */
+async function templateConfigFile(path: string, template: Record<string, unknown>): Promise<Record<string, unknown>> {
+  // A plugin with no settings has nothing to template — don't litter the config
+  // dir with empty stub files.
+  if (Object.keys(template).length === 0) return {};
+  let existing: unknown = undefined;
+  let raw: string | undefined;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch { /* file doesn't exist → synthesise it from the template below */ }
+  if (raw !== undefined) {
+    try {
+      existing = JSON.parse(raw);
+    } catch {
+      // The file exists but is invalid JSON — it may be a hand-edited config we
+      // must not clobber. Leave it alone; the operator will see the parse error
+      // when the harness reads it.
+      console.warn(`Skipping templating of ${path}: existing file is not valid JSON`);
+      return {};
+    }
+  }
+  const { value, changed } = fillDefaults(existing, template);
+  if (changed) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, stringifyConfig(value), 'utf8');
+  }
+  return value as Record<string, unknown>;
+}
 
 function applyEnv(raw: string): string {
   return raw.replace(/\${([^}]+)}/g, (_, expr) => {
@@ -305,31 +400,60 @@ export async function loadPlugins(pluginsDir: string, cfgPath: string): Promise<
 
   const subdirs = entries.filter(e => e.isDirectory());
 
-  // If config.json is missing, write a minimal default
-  if (!(await fileExists(cfgPath))) {
-    console.log(`No config.json found — generating default at ${cfgPath}`);
-    const cfg = { ...BASE_CONFIG };
-    await writeFile(cfgPath, stringifyConfig(cfg), 'utf8');
-    console.log('Default config.json written. Edit it then restart.');
+  // Template the application config: write it from scratch if missing, or
+  // back-fill any newly added fields into an existing one. Either way config.json
+  // ends up listing every application setting the harness understands.
+  const existedBefore = await fileExists(cfgPath);
+  await templateConfigFile(cfgPath, BASE_CONFIG);
+  if (!existedBefore) {
+    console.log(`No config.json found — generated default at ${cfgPath}. Edit it then restart.`);
   }
+  applicationDiscovery = { defaults: BASE_CONFIG as Record<string, unknown>, configPath: cfgPath };
 
+  // Reset per-plugin discovery so repeated loads (e.g. in tests) don't accumulate.
+  pluginDiscovery.length = 0;
+
+  const configDirForPlugins = dirname(cfgPath);
   const loaded: string[] = [];
   const failed: string[] = [];
 
   for (const entry of subdirs) {
     const pluginName = entry.name;
     const indexPath = resolvePath(absDir, pluginName, 'index.ts');
+    const pluginCfgPath = join(configDirForPlugins, pluginName, 'config.json');
+
+    let mod: { setup?: (cfg: PluginConfig) => void | Promise<void>; defaultConfig?: Record<string, unknown> };
     try {
-      const mod = await import(indexPath) as { setup?: (cfg: PluginConfig) => void | Promise<void> };
-      if (typeof mod.setup === 'function') {
-        await mod.setup(makePluginConfig(pluginName, cfgPath));
-        loaded.push(pluginName);
-      } else {
-        console.warn(`Plugin "${pluginName}" has no setup() export — skipped`);
-      }
+      mod = await import(indexPath);
     } catch (e) {
       failed.push(pluginName);
       console.warn(`Failed to load plugin "${pluginName}": ${(e as Error).message}`);
+      continue;
+    }
+
+    // Template the plugin's own config file from its exported defaultConfig, and
+    // record it for discovery — independent of whether setup() succeeds, so a
+    // plugin whose tools fail to register still gets a documented config stub.
+    const defaults = mod.defaultConfig ?? {};
+    try {
+      await templateConfigFile(pluginCfgPath, defaults);
+    } catch (e) {
+      console.warn(`Failed to template config for plugin "${pluginName}": ${(e as Error).message}`);
+    }
+    const discovery: PluginDiscovery = { name: pluginName, defaults, configPath: pluginCfgPath, loaded: false };
+    pluginDiscovery.push(discovery);
+
+    if (typeof mod.setup === 'function') {
+      try {
+        await mod.setup(makePluginConfig(pluginName, cfgPath));
+        discovery.loaded = true;
+        loaded.push(pluginName);
+      } catch (e) {
+        failed.push(pluginName);
+        console.warn(`Failed to load plugin "${pluginName}": ${(e as Error).message}`);
+      }
+    } else {
+      console.warn(`Plugin "${pluginName}" has no setup() export — skipped`);
     }
   }
 

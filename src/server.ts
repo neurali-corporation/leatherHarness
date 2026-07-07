@@ -2,8 +2,9 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve as resolvePath, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { loadPlugins } from './plugin-loader.ts';
+import { loadPlugins, getDiscovery } from './plugin-loader.ts';
 import { loadMcpServers } from './mcp.ts';
+import { toolSchemas } from './registry.ts';
 import { resolveRequest } from './resolve.ts';
 import { matchRoute } from './http-registry.ts';
 import { setListen, noteHost } from './runtime.ts';
@@ -369,6 +370,24 @@ async function main() {
       };
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(metrics));
+      return;
+    }
+
+    // Discovery: report every configurable surface of the harness — the
+    // application settings template, each plugin's config schema, the live tool
+    // catalogue, and configured MCP servers. Reflects the templates written to
+    // disk at startup, so a client can discover what is configurable without
+    // reading any files. Only schemas/defaults are exposed, never the user's
+    // resolved secret values.
+    if (req.method === 'GET' && pathname === '/api/discovery') {
+      const discovery = getDiscovery();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        application: discovery.application,
+        plugins: discovery.plugins,
+        tools: toolSchemas(),
+        mcpServers: Object.keys(config.mcpServers ?? {}),
+      }));
       return;
     }
 
