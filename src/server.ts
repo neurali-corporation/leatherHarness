@@ -11,6 +11,70 @@ import { setListen, noteHost } from './runtime.ts';
 import { uiIconList, runUiIcon } from './ui-registry.ts';
 import { initModelLauncher, resetModelLauncher } from './model-launcher.ts';
 
+// ── OpenAI Responses API ↔ chat/completions translation ─────────────────────
+// OMP (and other newer clients) speak the Responses API instead of
+// /chat/completions. Our core (resolveRequest) only understands chat messages,
+// so we translate the request in and the results back out. Statefulness
+// (previous_response_id) is not supported — clients must send full `input`.
+
+// Flatten a Responses content value (string | array of parts) to plain text.
+function responsesContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((p: any) => (typeof p === 'string' ? p : (p?.text ?? '')))
+      .join('');
+  }
+  return '';
+}
+
+// Build chat `messages` from a Responses request (`instructions` + `input`).
+function responsesToMessages(json: any): any[] {
+  const messages: any[] = [];
+  if (json.instructions) messages.push({ role: 'system', content: String(json.instructions) });
+  const input = json.input;
+  if (typeof input === 'string') {
+    messages.push({ role: 'user', content: input });
+  } else if (Array.isArray(input)) {
+    for (const item of input) {
+      if (item == null) continue;
+      if (typeof item === 'string') { messages.push({ role: 'user', content: item }); continue; }
+      // A prior tool result the client is feeding back in.
+      if (item.type === 'function_call_output') {
+        messages.push({ role: 'tool', tool_call_id: item.call_id, content: String(item.output ?? '') });
+        continue;
+      }
+      // A prior assistant tool call the client is echoing back.
+      if (item.type === 'function_call') {
+        messages.push({
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: item.call_id,
+            type: 'function',
+            function: { name: item.name, arguments: item.arguments ?? '' },
+          }],
+        });
+        continue;
+      }
+      messages.push({ role: item.role ?? 'user', content: responsesContentText(item.content) });
+    }
+  }
+  return messages;
+}
+
+// Responses tools are flat ({type:'function', name, ...}); chat nests them
+// under a `function` key.
+function responsesToolsToChat(tools: unknown): any[] {
+  if (!Array.isArray(tools)) return [];
+  return tools
+    .filter((t: any) => t && t.type === 'function')
+    .map((t: any) => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.parameters },
+    }));
+}
+
 // ── secret-based auth (global, with OpenAI-compatible Bearer header) ────────
 const AUTH_COOKIE = 'lh-secret';
 
@@ -416,6 +480,127 @@ async function main() {
       return;
     }
 
+    // OpenAI Responses API. Translate to chat messages, run the agentic core,
+    // and translate the result back into Responses shape (streamed or not).
+    if (req.method === 'POST' && (pathname === '/v1/responses' || pathname === '/responses')) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const json = JSON.parse(body);
+      console.log('🔹 Incoming /responses, stream:', json.stream ?? false);
+
+      const chatBody = {
+        model: json.model,
+        messages: responsesToMessages(json),
+        tools: responsesToolsToChat(json.tools),
+        stream: !!json.stream,
+      };
+      const respId = 'resp_' + Math.random().toString(36).slice(2);
+      const msgId = 'msg_' + Math.random().toString(36).slice(2);
+      const created = Math.floor(Date.now() / 1000);
+      const model = json.model ?? 'leatherharness';
+
+      if (json.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+        let seq = 0;
+        const send = (type: string, payload: object) => {
+          if (res.writableEnded || !res.writable) return;
+          res.write(`data: ${JSON.stringify({ type, sequence_number: seq++, ...payload })}\n\n`);
+        };
+        const baseResponse = (status: string) => ({
+          id: respId, object: 'response', created_at: created, status, model,
+          output: [] as unknown[], usage: null as unknown,
+        });
+
+        send('response.created', { response: baseResponse('in_progress') });
+        const item = { id: msgId, type: 'message', status: 'in_progress', role: 'assistant', content: [] as unknown[] };
+        send('response.output_item.added', { output_index: 0, item });
+        send('response.content_part.added', { item_id: msgId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+
+        let text = '';
+        let usage: any = {};
+        const emit = (ev: object) => {
+          const e = ev as any;
+          switch (e.t) {
+            case 'delta':
+              if (e.text) { text += e.text; send('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: e.text }); }
+              break;
+            case 'done':
+              usage = e.usage ?? {};
+              break;
+            case 'error':
+              send('response.error', { message: e.message });
+              break;
+            // reasoning / tool_calls / metrics are harness-internal — suppressed.
+          }
+        };
+
+        try {
+          await resolveRequest(chatBody, config, emit);
+        } catch (e: any) {
+          console.error('❌ resolveRequest error (/responses):', e);
+          if (!res.writableEnded && res.writable) {
+            send('response.error', { message: e.message });
+            send('response.failed', { response: baseResponse('failed') });
+            res.end();
+          }
+          return;
+        }
+
+        if (!res.writableEnded && res.writable) {
+          const usageOut = {
+            input_tokens: usage.prompt_tokens ?? 0,
+            output_tokens: usage.completion_tokens ?? 0,
+            total_tokens: usage.total_tokens ?? 0,
+          };
+          const finalContent = [{ type: 'output_text', text, annotations: [] }];
+          send('response.output_text.done', { item_id: msgId, output_index: 0, content_index: 0, text });
+          send('response.content_part.done', { item_id: msgId, output_index: 0, content_index: 0, part: finalContent[0] });
+          send('response.output_item.done', { output_index: 0, item: { ...item, status: 'completed', content: finalContent } });
+          const done = baseResponse('completed');
+          done.output = [{ ...item, status: 'completed', content: finalContent }];
+          done.usage = usageOut;
+          send('response.completed', { response: done });
+          res.end();
+        }
+        return;
+      }
+
+      // Non-streaming.
+      let result: any;
+      try {
+        result = await resolveRequest(chatBody, config);
+      } catch (e) {
+        console.error('❌ resolveRequest error (/responses):', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Internal server error' } }));
+        return;
+      }
+      if (result?.error) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: result.error }));
+        return;
+      }
+      const text = result?.choices?.[0]?.message?.content ?? '';
+      const usage = result?.usage ?? {};
+      const responseObj = {
+        id: respId, object: 'response', created_at: created, status: 'completed', model,
+        output: [{ id: msgId, type: 'message', status: 'completed', role: 'assistant',
+          content: [{ type: 'output_text', text, annotations: [] }] }],
+        usage: {
+          input_tokens: usage.prompt_tokens ?? 0,
+          output_tokens: usage.completion_tokens ?? 0,
+          total_tokens: usage.total_tokens ?? 0,
+        },
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(responseObj));
+      return;
+    }
+
     // Plugin-contributed UI icons: list them, and run one on click.
     if (req.method === 'GET' && pathname === '/api/ui/icons') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -460,6 +645,25 @@ async function main() {
         // Upstream unreachable — treat as "no model running".
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(empty));
+      }
+      return;
+    }
+
+    // llama.cpp server props (context size, chat template, default sampling).
+    // Clients like OMP probe this to learn the model's capabilities. llama.cpp
+    // serves it at the root (not under /v1), so strip the /v1 suffix as the
+    // metrics handler does. Proxy straight through.
+    if (req.method === 'GET' && (pathname === '/props' || pathname === '/v1/props')) {
+      const base = config.upstream.baseUrl.replace(/\/v1\/?$/, '');
+      try {
+        const resp = await fetch(base + '/props');
+        const text = await resp.text();
+        res.writeHead(resp.status, { 'Content-Type': 'application/json' });
+        res.end(text);
+      } catch {
+        // Upstream unreachable — mirror /models' graceful degradation.
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'upstream unreachable' } }));
       }
       return;
     }
