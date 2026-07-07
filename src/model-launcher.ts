@@ -362,7 +362,7 @@ export function createModelLauncher(config: ModelLauncherConfig) {
       });
 
       try {
-        currentProcess.kill('SIGTERM');
+        currentProcess?.kill('SIGTERM');
       } catch (e: any) {
         clearTimeout(timeout);
         console.warn(`Failed to stop model ${modelName}:`, e.message);

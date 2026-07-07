@@ -55,6 +55,50 @@ function authFail(res: http.ServerResponse, redirectToLogin: boolean = false): v
   }
 }
 
+// Minimal self-contained login page served at GET /auth/login. It posts the
+// secret back to the same path; the POST handler validates it and sets the
+// AUTH_COOKIE. `error` renders the "incorrect secret" hint after a failed try.
+function loginPageHtml(error: boolean = false): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — leatherHarness</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font: 15px/1.5 system-ui, sans-serif; background: #16181d; color: #e6e6e6; }
+    form { background: #1e2127; padding: 32px; border-radius: 12px; width: 300px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+    h1 { margin: 0 0 20px; font-size: 18px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 10px 12px; margin-bottom: 14px;
+      background: #12141a; border: 1px solid #333842; border-radius: 8px; color: #e6e6e6; font-size: 14px; }
+    input:focus { outline: none; border-color: #5b8def; }
+    button { width: 100%; padding: 10px; border: 0; border-radius: 8px; cursor: pointer;
+      background: #5b8def; color: #fff; font-size: 14px; font-weight: 600; }
+    button:hover { background: #4a7ce0; }
+    .err { color: #ff6b6b; margin: 0 0 14px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <form method="POST" action="/auth/login">
+    <h1>Sign in</h1>
+    ${error ? '<p class="err">Incorrect secret. Try again.</p>' : ''}
+    <input type="password" name="secret" placeholder="Secret" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>`;
+}
+
+// Serialize a Set-Cookie for the auth session. Value is the secret itself so
+// checkAuth's raw comparison matches. HttpOnly keeps it out of JS; SameSite=Lax
+// lets the post-login redirect carry it.
+function authCookie(secret: string): string {
+  return `${AUTH_COOKIE}=${secret}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`;
+}
+
 // Global stats tracking
 const globalStats = {
   totalRequests: 0,
@@ -141,6 +185,49 @@ async function main() {
           return;
         }
       }
+    }
+
+    // ── login flow ─────────────────────────────────────────────────────────
+    // GET renders the form; POST validates the secret and sets the auth cookie.
+    // Both are reachable without auth (the gate above lets /auth/* fall through).
+    if (pathname === '/auth/login' && req.method === 'GET') {
+      // Already authenticated (or no secret configured) → no need to log in.
+      if (checkAuth(req, config.secret)) {
+        res.writeHead(302, { Location: '/' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(loginPageHtml(false));
+      return;
+    }
+    if (pathname === '/auth/login' && req.method === 'POST') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      // Accept both the HTML form (x-www-form-urlencoded) and JSON.
+      let submitted = '';
+      const ct = req.headers['content-type'] ?? '';
+      if (ct.includes('application/json')) {
+        try { submitted = JSON.parse(body).secret ?? ''; } catch { submitted = ''; }
+      } else {
+        submitted = new URLSearchParams(body).get('secret') ?? '';
+      }
+      if (config.secret && submitted === config.secret) {
+        res.writeHead(302, { Location: '/', 'Set-Cookie': authCookie(config.secret) });
+        res.end();
+      } else {
+        res.writeHead(401, { 'Content-Type': 'text/html' });
+        res.end(loginPageHtml(true));
+      }
+      return;
+    }
+    if (pathname === '/auth/logout') {
+      res.writeHead(302, {
+        Location: '/auth/login',
+        'Set-Cookie': `${AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+      });
+      res.end();
+      return;
     }
 
     const route = matchRoute(pathname);
@@ -433,7 +520,7 @@ async function main() {
         
         // Fetch with retry in case upstream is slow to populate metrics
         let text = '';
-        let resp;
+        let resp: Response | undefined;
         for (let attempt = 1; attempt <= 3; attempt++) {
           resp = await fetch(upstreamUrl);
           text = await resp.text();
@@ -445,7 +532,12 @@ async function main() {
             await new Promise(r => setTimeout(r, 100 * attempt));
           }
         }
-        
+
+        // The loop runs at least once, so a successful fetch always assigns
+        // resp; a thrown fetch would have jumped to the catch below. This guard
+        // just proves that to the type-checker (and 502s if it ever holds).
+        if (!resp) throw new Error('No response from upstream metrics');
+
         console.log('Upstream metrics final status:', resp.status, 'length:', text.length);
         const contentType = resp.headers.get('content-type') || 'text/plain';
         res.writeHead(resp.status, { 'Content-Type': contentType });
