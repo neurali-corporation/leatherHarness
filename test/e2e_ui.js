@@ -3,6 +3,9 @@
 // and return an action for the UI. Driven in-code (no server), per house rules.
 
 import { strict as assert } from 'node:assert';
+import { mkdtemp, mkdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve as resolvePath } from 'node:path';
 import { registerUiIcon, uiIconList, runUiIcon } from '../src/ui-registry.ts';
 
 async function run() {
@@ -45,11 +48,17 @@ async function run() {
 
   // ── the music plugin contributes an icon when it loads ──
   const { setup } = await import('../plugins/music/index.ts');
-  setup({ get: async () => ({ allowedDirs: ['/tmp'] }), set: async () => {} });
+  const pluginDir = await mkdtemp(resolvePath(tmpdir(), 'music-plugin-ui-'));
+  setup({
+    get: async () => ({ allowedDirs: ['/tmp'] }),
+    set: async () => {},
+    dir: pluginDir,
+    ensureDir: async () => { await mkdir(pluginDir, { recursive: true }); return pluginDir; },
+  });
   const musicIcon = uiIconList().find((i) => i.id === 'music');
   assert.ok(musicIcon, 'music plugin registered a UI icon');
   assert.equal(musicIcon.icon, '🎵', 'music icon glyph');
-  assert.deepEqual(await runUiIcon('music'), { open: '/music/player' }, 'music icon opens the player');
+  assert.deepEqual(await runUiIcon('music'), { open: '/api/plugin/music/player' }, 'music icon opens the player');
 
   console.log('All UI icon tests passed');
 }

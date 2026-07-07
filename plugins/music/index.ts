@@ -43,241 +43,226 @@ export interface Track {
 }
 
 // ── playlist storage ─────────────────────────────────────────────────────────
-// Playlists are persisted on disk inside the plugin's own directory so they
-// survive restarts. If no playlist exists yet, a "default" playlist is created
-// on first use. Each playlist is a JSON file containing an ordered list of
-// track paths (strings).
+// Playlists are named, ordered lists of track paths, persisted on disk inside
+// the plugin's own directory (`<plugin dir>/playlists/<name>.json`) so they
+// survive restarts. Every operation is keyed by playlist name; when no name is
+// given we fall back to a "default" playlist, creating it on first use. There is
+// deliberately no hidden "current playlist" state — each call names its target,
+// which keeps the model tools and the UI from stepping on each other.
 
 export interface Playlist {
   name: string;
-  tracks: string[];  // absolute file paths
+  tracks: string[];  // absolute file paths, in order
 }
 
 // Set by setup() from the directory the app assigns this plugin (cfg.dir) — we
 // don't decide our own absolute path. Playlists live under `<plugin dir>/playlists`.
 let PLAYLISTS_DIR = '';
 
-async function ensurePlaylistsDir(): Promise<void> {
-  await mkdir(PLAYLISTS_DIR, { recursive: true });
+const DEFAULT_PLAYLIST = 'default';
+
+// Turn a user/model-supplied name into a safe file base: no path separators or
+// traversal, trimmed, non-empty. Purely presentational chars are kept as-is.
+export function safePlaylistName(name: string | null | undefined): string {
+  const cleaned = (name ?? '').trim().replace(/[/\\]/g, '_').replace(/\.+/g, '.');
+  const base = cleaned.replace(/[^A-Za-z0-9 ._-]/g, '_').replace(/^\.+/, '').trim();
+  return base.slice(0, 100) || DEFAULT_PLAYLIST;
 }
 
-async function listPlaylistFiles(): Promise<string[]> {
-  try {
-    const files = await readdir(PLAYLISTS_DIR);
-    return files.filter(f => f.endsWith('.json')).sort();
-  } catch { return []; }
+async function ensurePlaylistsDir(): Promise<void> {
+  await mkdir(PLAYLISTS_DIR, { recursive: true });
 }
 
 async function readPlaylistFile(name: string): Promise<Playlist | null> {
   try {
     const raw = await readFile(join(PLAYLISTS_DIR, `${name}.json`), 'utf8');
     const p = JSON.parse(raw) as Playlist;
-    if (p && Array.isArray(p.tracks)) return p;
+    if (p && Array.isArray(p.tracks)) return { name, tracks: p.tracks };
     return null;
   } catch { return null; }
 }
 
-async function writePlaylistFile(name: string, pl: Playlist): Promise<void> {
+async function writePlaylistFile(pl: Playlist): Promise<void> {
   await ensurePlaylistsDir();
-  await writeFile(join(PLAYLISTS_DIR, `${name}.json`), JSON.stringify(pl, null, 2), 'utf8');
+  await writeFile(join(PLAYLISTS_DIR, `${pl.name}.json`), JSON.stringify(pl, null, 2), 'utf8');
 }
 
-async function deletePlaylistFile(name: string): Promise<boolean> {
+/** All playlist names on disk (sorted, without the .json extension). */
+export async function listPlaylists(): Promise<string[]> {
+  let files: string[] = [];
   try {
-    await rm(join(PLAYLISTS_DIR, `${name}.json`), { force: true });
+    files = await readdir(PLAYLISTS_DIR);
+  } catch { /* dir not created yet */ }
+  const names = files.filter(f => f.endsWith('.json')).map(f => f.slice(0, -5));
+  // "default" always exists conceptually, even before anything is written.
+  if (!names.includes(DEFAULT_PLAYLIST)) names.push(DEFAULT_PLAYLIST);
+  return names.sort();
+}
+
+/** Read a playlist, creating an empty one (persisted) if it doesn't exist yet. */
+export async function getPlaylist(name?: string): Promise<Playlist> {
+  const safe = safePlaylistName(name);
+  const existing = await readPlaylistFile(safe);
+  if (existing) return existing;
+  const pl: Playlist = { name: safe, tracks: [] };
+  await writePlaylistFile(pl);
+  return pl;
+}
+
+/** Create a new (or reset an existing to empty) playlist. Returns it. */
+export async function createPlaylist(name: string): Promise<Playlist> {
+  const pl: Playlist = { name: safePlaylistName(name), tracks: [] };
+  await writePlaylistFile(pl);
+  return pl;
+}
+
+/** Delete a playlist by name. The "default" playlist cannot be deleted. */
+export async function deletePlaylist(name: string): Promise<boolean> {
+  const safe = safePlaylistName(name);
+  if (safe === DEFAULT_PLAYLIST) return false;
+  try {
+    await rm(join(PLAYLISTS_DIR, `${safe}.json`), { force: true });
     return true;
   } catch { return false; }
 }
 
-/** Ensure a "default" playlist exists. Returns the playlist name. */
-async function ensureDefaultPlaylist(): Promise<string> {
-  const existing = await readPlaylistFile('default');
-  if (existing) return 'default';
-  await writePlaylistFile('default', { name: 'default', tracks: [] });
-  return 'default';
-}
-
-export interface PlaylistState {
-  name: string;
-  tracks: string[];
-}
-
-let currentPlaylist: PlaylistState = { name: 'default', tracks: [] };
-
-async function loadCurrentPlaylist(): Promise<PlaylistState> {
-  const name = await ensureDefaultPlaylist();
-  const pl = await readPlaylistFile(name);
-  currentPlaylist = pl || { name, tracks: [] };
-  return currentPlaylist;
-}
-
-async function saveCurrentPlaylist(): Promise<void> {
-  await writePlaylistFile(currentPlaylist.name, currentPlaylist);
-}
-
-/** Get the current playlist name. */
-export function getCurrentPlaylistName(): string {
-  return currentPlaylist.name;
-}
-
-/** Switch the active playlist by name. Creates it if it doesn't exist. */
-export async function switchPlaylist(name: string): Promise<PlaylistState> {
-  const pl = await readPlaylistFile(name);
-  currentPlaylist = pl || { name, tracks: [] };
-  await writePlaylistFile(name, currentPlaylist);
-  return currentPlaylist;
-}
-
-/** Get all available playlist names. */
-export async function listPlaylists(): Promise<string[]> {
-  return listPlaylistFiles();
-}
-
-/** Create a new empty playlist. Returns the playlist. */
-export async function createPlaylist(name: string): Promise<PlaylistState> {
-  const pl: PlaylistState = { name, tracks: [] };
-  await writePlaylistFile(name, pl);
+/** Append tracks (by path) to a playlist. Returns the updated playlist. */
+export async function addToPlaylist(name: string | undefined, paths: string[]): Promise<Playlist> {
+  const pl = await getPlaylist(name);
+  pl.tracks.push(...paths);
+  await writePlaylistFile(pl);
   return pl;
 }
 
-/** Delete a playlist by name. */
-export async function deletePlaylist(name: string): Promise<boolean> {
-  // Don't allow deleting the "default" playlist
-  if (name === 'default') return false;
-  const deleted = await deletePlaylistFile(name);
-  if (deleted && currentPlaylist.name === name) {
-    await ensureDefaultPlaylist();
+/** Remove a track from a playlist by index. Returns the updated playlist. */
+export async function removeFromPlaylist(name: string | undefined, index: number): Promise<Playlist> {
+  const pl = await getPlaylist(name);
+  if (index >= 0 && index < pl.tracks.length) {
+    pl.tracks.splice(index, 1);
+    await writePlaylistFile(pl);
   }
-  return deleted;
+  return pl;
 }
 
-/** Add tracks (by path) to the current playlist. Returns the updated playlist. */
-export async function addToPlaylist(paths: string[]): Promise<PlaylistState> {
-  currentPlaylist.tracks.push(...paths);
-  await saveCurrentPlaylist();
-  return currentPlaylist;
+/** Clear all tracks from a playlist. Returns the (now empty) playlist. */
+export async function clearPlaylist(name?: string): Promise<Playlist> {
+  const pl = await getPlaylist(name);
+  pl.tracks = [];
+  await writePlaylistFile(pl);
+  return pl;
 }
 
-/** Remove a track from the current playlist by index. Returns the updated playlist. */
-export async function removeFromPlaylist(index: number): Promise<PlaylistState> {
-  if (index >= 0 && index < currentPlaylist.tracks.length) {
-    currentPlaylist.tracks.splice(index, 1);
-    await saveCurrentPlaylist();
+/** Reorder a playlist (move track at `from` to `to`). Returns the playlist. */
+export async function reorderPlaylist(name: string | undefined, from: number, to: number): Promise<Playlist> {
+  const pl = await getPlaylist(name);
+  if (from >= 0 && from < pl.tracks.length && to >= 0 && to < pl.tracks.length) {
+    const [track] = pl.tracks.splice(from, 1);
+    pl.tracks.splice(to, 0, track);
+    await writePlaylistFile(pl);
   }
-  return currentPlaylist;
+  return pl;
 }
 
-/** Clear all tracks from the current playlist. */
-export async function clearPlaylist(): Promise<PlaylistState> {
-  currentPlaylist.tracks = [];
-  await saveCurrentPlaylist();
-  return currentPlaylist;
+/** Resolve a Playlist's stored paths to Track objects (dropping any now-disallowed). */
+export function resolvePlaylistTracks(pl: Playlist, allowedDirs: string[]): Track[] {
+  return pl.tracks.filter((p) => pathAllowed(p, allowedDirs)).map(toTrack);
 }
 
-/** Reorder the current playlist (move track at `from` to `to`). */
-export async function reorderPlaylist(from: number, to: number): Promise<PlaylistState> {
-  if (from >= 0 && from < currentPlaylist.tracks.length && to >= 0 && to < currentPlaylist.tracks.length) {
-    const [track] = currentPlaylist.tracks.splice(from, 1);
-    currentPlaylist.tracks.splice(to, 0, track);
-    await saveCurrentPlaylist();
-  }
-  return currentPlaylist;
+/** Resolve a playlist (by name) to Track objects. */
+export async function getPlaylistTracks(name: string | undefined, allowedDirs: string[]): Promise<Track[]> {
+  return resolvePlaylistTracks(await getPlaylist(name), allowedDirs);
 }
 
-/** Export the current playlist as a list of Track objects. */
-export async function getPlaylistTracks(allowedDirs: string[]): Promise<Track[]> {
-  const tracks: Track[] = [];
-  for (const path of currentPlaylist.tracks) {
-    if (pathAllowed(path, allowedDirs)) {
-      tracks.push(toTrack(path));
-    }
-  }
-  return tracks;
-}
+// ── playback state ───────────────────────────────────────────────────────────
+// There is no separate "queue": playback is always *a playlist*. The server
+// tracks which playlist is currently PLAYING (by name) plus a snapshot of its
+// tracks and the position within them. This is distinct from whichever playlist
+// a given player tab is VIEWING — selecting a tab only changes the view, never
+// playback. Playback changes only when a track is played (from any tab). One
+// server-side playback state is shared by the model and every open player tab.
 
-// ── shared playback queue ────────────────────────────────────────────────────
-// One server-side queue is the single source of truth shared by the model (via
-// tools) and every open player tab. "Playing" appends to it and plays from there.
-
-export interface QueueState {
-  tracks: Track[];
-  current: number;   // index of the track to play (−1 = none)
-  serial: number;    // bumps whenever the track list changes
-  playSerial: number; // bumps whenever a new "play now" command is issued
+export interface PlaybackState {
+  playlist: string | null; // name of the playlist currently playing (null = nothing)
+  tracks: Track[];         // snapshot of that playlist's resolved tracks
+  current: number;         // index of the track to play (−1 = none)
+  serial: number;          // bumps whenever the playing track list changes
+  playSerial: number;      // bumps whenever a new "play now" command is issued
   paused: boolean;
-  pauseTime: number; // last-seen playback position (seconds) when paused
+  pauseTime: number;       // last-seen playback position (seconds) when paused
 }
 
-const Q: QueueState = { tracks: [], current: -1, serial: 0, playSerial: 0, paused: false, pauseTime: 0 };
+const PB: PlaybackState = {
+  playlist: null, tracks: [], current: -1, serial: 0, playSerial: 0, paused: false, pauseTime: 0,
+};
 
-function queueSnapshot(): QueueState {
+export function playbackSnapshot(): PlaybackState {
   return {
-    tracks: Q.tracks.slice(),
-    current: Q.current,
-    serial: Q.serial,
-    playSerial: Q.playSerial,
-    paused: Q.paused,
-    pauseTime: Q.pauseTime,
+    playlist: PB.playlist,
+    tracks: PB.tracks.slice(),
+    current: PB.current,
+    serial: PB.serial,
+    playSerial: PB.playSerial,
+    paused: PB.paused,
+    pauseTime: PB.pauseTime,
   };
 }
 
-/** Append tracks; when `play`, jump playback to the first newly-added track. */
-export function queueEnqueue(newTracks: Track[], play: boolean): QueueState {
-  if (newTracks.length) {
-    const at = Q.tracks.length;
-    Q.tracks = Q.tracks.concat(newTracks);
-    Q.serial++;
-    if (play) { Q.current = at; Q.playSerial++; }
-    else if (Q.current < 0) Q.current = at; // first ever add: cue it but don't autoplay
+/**
+ * Start playing a named playlist from `index`. Loads a fresh snapshot of the
+ * playlist's tracks and makes it the playing playlist. This is the only thing
+ * that changes *what* is playing — viewing a tab does not call it.
+ */
+export async function playPlaylistFrom(
+  name: string | undefined, index: number, allowedDirs: string[],
+): Promise<PlaybackState> {
+  const pl = await getPlaylist(name);
+  PB.playlist = pl.name;
+  PB.tracks = pl.tracks.filter((p) => pathAllowed(p, allowedDirs)).map(toTrack);
+  PB.current = (index >= 0 && index < PB.tracks.length) ? index : (PB.tracks.length ? 0 : -1);
+  PB.serial++;
+  PB.playSerial++;
+  PB.paused = false;
+  PB.pauseTime = 0;
+  return playbackSnapshot();
+}
+
+/** Jump to another track within the already-playing playlist. */
+export function playbackPlayIndex(index: number): PlaybackState {
+  if (index >= 0 && index < PB.tracks.length) { PB.current = index; PB.playSerial++; PB.paused = false; }
+  return playbackSnapshot();
+}
+
+/**
+ * Reconcile playback after a playlist file changed. If the edited playlist is the
+ * one currently playing, refresh its track snapshot so open tabs see the change;
+ * keep playing the same track where possible.
+ */
+export function syncPlaybackWithPlaylist(name: string, tracks: Track[]): PlaybackState {
+  if (PB.playlist === name) {
+    const playingPath = PB.current >= 0 ? PB.tracks[PB.current]?.path : null;
+    PB.tracks = tracks;
+    const at = playingPath ? tracks.findIndex((t) => t.path === playingPath) : -1;
+    PB.current = at >= 0 ? at : Math.min(PB.current, tracks.length - 1);
+    PB.serial++;
   }
-  return queueSnapshot();
+  return playbackSnapshot();
 }
 
-export function queuePlay(index: number): QueueState {
-  if (index >= 0 && index < Q.tracks.length) { Q.current = index; Q.playSerial++; }
-  return queueSnapshot();
+export function playbackPause(): PlaybackState {
+  PB.paused = true;
+  return playbackSnapshot();
 }
 
-export function queueRemove(index: number): QueueState {
-  if (index >= 0 && index < Q.tracks.length) {
-    Q.tracks = Q.tracks.slice(0, index).concat(Q.tracks.slice(index + 1));
-    if (index < Q.current) Q.current--;
-    else if (index === Q.current) Q.current = Math.min(Q.current, Q.tracks.length - 1);
-    Q.serial++;
+export function playbackResume(currentTime: number, currentTrack: number): PlaybackState {
+  if (currentTrack >= 0 && currentTrack < PB.tracks.length) {
+    PB.current = currentTrack;
+  } else if (PB.current < 0 && PB.tracks.length > 0) {
+    PB.current = 0;
   }
-  return queueSnapshot();
-}
-
-export function queueClear(): QueueState {
-  Q.tracks = []; Q.current = -1; Q.serial++; Q.playSerial++;
-  Q.paused = true; Q.pauseTime = 0;
-  return queueSnapshot();
-}
-
-export function queuePause(): QueueState {
-  Q.paused = true;
-  return queueSnapshot();
-}
-
-export function queueResume(
-  currentTime: number,
-  currentTrack: number,
-): QueueState {
-  if (currentTrack >= 0 && currentTrack < Q.tracks.length) {
-    Q.current = currentTrack;
-    Q.paused = false;
-    Q.pauseTime = currentTime;
-    Q.playSerial++;
-  } else if (currentTrack < 0 && Q.tracks.length > 0) {
-    Q.current = 0;
-    Q.paused = false;
-    Q.pauseTime = currentTime;
-    Q.playSerial++;
-  } else {
-    Q.paused = false;
-    Q.pauseTime = 0;
-  }
-  return queueSnapshot();
+  PB.paused = false;
+  PB.pauseTime = PB.current >= 0 ? currentTime : 0;
+  if (PB.current >= 0) PB.playSerial++;
+  return playbackSnapshot();
 }
 
 // ── path safety ────────────────────────────────────────────────────────────
@@ -499,17 +484,13 @@ export function handleMusicRequest(
     return streamNative(req, res, abs);
   }
 
-  // ── playlists ──
+  // ── playlists (all keyed by ?name=, defaulting to "default") ──
   if (route === '/api/playlists') {
     return listPlaylists().then((names) => json(200, names));
   }
-  if (route === '/api/playlist/current') {
-    return loadCurrentPlaylist().then((pl) => json(200, pl));
-  }
-  if (route === '/api/playlist/switch') {
-    const name = url.searchParams.get('name');
-    if (!name) return json(400, { error: 'name required' });
-    return switchPlaylist(name).then((pl) => json(200, pl));
+  // Read one named playlist (creates "default" on first use).
+  if (route === '/api/playlist/get') {
+    return getPlaylist(url.searchParams.get('name') ?? undefined).then((pl) => json(200, pl));
   }
   if (route === '/api/playlist/create') {
     const name = url.searchParams.get('name');
@@ -521,50 +502,56 @@ export function handleMusicRequest(
     if (!name) return json(400, { error: 'name required' });
     return deletePlaylist(name).then((deleted) => json(200, { deleted }));
   }
+  // Mutations persist to disk and, if they hit the *playing* playlist, refresh
+  // the live playback snapshot so open tabs pick up the change.
+  const mutated = (pl: Playlist) => {
+    syncPlaybackWithPlaylist(pl.name, resolvePlaylistTracks(pl, allowedDirs));
+    return json(200, pl);
+  };
   if (route === '/api/playlist/add') {
     const paths = url.searchParams.getAll('path');
+    // A path can be a folder — expand it recursively to audio files.
     if (!paths.length) return json(400, { error: 'path required' });
-    return addToPlaylist(paths).then((pl) => json(200, pl));
+    return Promise.all(paths.map((p) => buildPlaylist(p, allowedDirs)))
+      .then((lists) => lists.flat().map((t) => t.path))
+      .then((expanded) => addToPlaylist(url.searchParams.get('name') ?? undefined, expanded))
+      .then(mutated);
   }
   if (route === '/api/playlist/remove') {
     const index = parseInt(url.searchParams.get('index') ?? '-1', 10);
-    return removeFromPlaylist(index).then((pl) => json(200, pl));
+    return removeFromPlaylist(url.searchParams.get('name') ?? undefined, index).then(mutated);
   }
   if (route === '/api/playlist/clear') {
-    return clearPlaylist().then((pl) => json(200, pl));
+    return clearPlaylist(url.searchParams.get('name') ?? undefined).then(mutated);
   }
   if (route === '/api/playlist/reorder') {
     const from = parseInt(url.searchParams.get('from') ?? '-1', 10);
     const to = parseInt(url.searchParams.get('to') ?? '-1', 10);
-    return reorderPlaylist(from, to).then((pl) => json(200, pl));
+    return reorderPlaylist(url.searchParams.get('name') ?? undefined, from, to).then(mutated);
   }
 
-  // ── shared queue ──
-  if (route === '/api/queue') {
-    return json(200, queueSnapshot());
+  // ── playback (always a playlist; separate from the viewed tab) ──
+  if (route === '/api/player') {
+    return json(200, playbackSnapshot());
   }
-  if (route === '/api/queue/add') {
-    const p = url.searchParams.get('path');
-    const play = url.searchParams.get('play') !== '0';
-    if (!p) return json(400, { error: 'path required' });
-    return buildPlaylist(p, allowedDirs).then((tracks) => json(200, queueEnqueue(tracks, play)));
+  // Start playing a playlist from a given index (default 0). The ONLY action
+  // that changes what is playing — viewing/switching a tab does not.
+  if (route === '/api/player/play') {
+    const index = parseInt(url.searchParams.get('index') ?? '0', 10);
+    return playPlaylistFrom(url.searchParams.get('name') ?? undefined, index, allowedDirs)
+      .then((st) => json(200, st));
   }
-  if (route === '/api/queue/play') {
-    return json(200, queuePlay(parseInt(url.searchParams.get('index') ?? '-1', 10)));
+  // Jump to another track within the already-playing playlist.
+  if (route === '/api/player/index') {
+    return json(200, playbackPlayIndex(parseInt(url.searchParams.get('index') ?? '-1', 10)));
   }
-  if (route === '/api/queue/remove') {
-    return json(200, queueRemove(parseInt(url.searchParams.get('index') ?? '-1', 10)));
+  if (route === '/api/player/pause') {
+    return json(200, playbackPause());
   }
-  if (route === '/api/queue/clear') {
-    return json(200, queueClear());
-  }
-  if (route === '/api/queue/pause') {
-    return json(200, queuePause());
-  }
-  if (route === '/api/queue/resume') {
+  if (route === '/api/player/resume') {
     const t = parseFloat(url.searchParams.get('time') ?? '0');
     const i = parseInt(url.searchParams.get('track') ?? '-1', 10);
-    return json(200, queueResume(t, i));
+    return json(200, playbackResume(t, i));
   }
 
   res.writeHead(404); res.end('Not found');
@@ -583,7 +570,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
   :root { --bg:#0a0a0a; --panel:#141414; --panel2:#1c1c1c; --accent:#00cc88; --text:#e0e0e0; --dim:#888; }
   html, body { overflow: hidden; }
   body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
-  main, .sidebar, .queue, .now { min-width: 0; }
+  main, .sidebar, .right, .now { min-width: 0; }
   header { padding: 14px 20px; background: var(--panel); display: flex; align-items: center; gap: 14px; border-bottom: 1px solid #222; }
   header h1 { font-size: 16px; font-weight: 600; }
   header h1 span { color: var(--accent); }
@@ -611,6 +598,16 @@ const PLAYER_HTML = `<!DOCTYPE html>
   .qx { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 13px; padding: 2px 4px; line-height: 1; flex: none; opacity: 0; }
   .row:hover .qx, .track:hover .qx { opacity: .7; }
   .qx:hover { opacity: 1 !important; color: var(--accent); }
+  /* Playlist tabs across the top of the right column. */
+  .tabs { display: flex; gap: 4px; padding: 8px 8px 0; overflow-x: auto; border-bottom: 1px solid #222; flex: none; }
+  .tab { background: var(--panel2); border: 1px solid #2a2a2a; border-bottom: none; color: var(--dim); font-size: 13px; padding: 7px 12px; border-radius: 8px 8px 0 0; cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+  .tab:hover { color: var(--text); }
+  .tab.on { color: var(--accent); border-color: var(--accent); background: var(--bg); }
+  .tab .dot { color: var(--accent); font-size: 10px; line-height: 1; }
+  .tab.add { font-weight: 600; }
+  .right { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .tracklist { overflow-y: auto; padding: 10px; flex: 1; }
+  .tracklist .qx { opacity: .6; }
   .track { padding: 9px 12px; border-radius: 7px; cursor: pointer; display: flex; align-items: center; gap: 10px; font-size: 13px; }
   .track:hover { background: var(--panel2); }
   .track.active { background: #0d2035; box-shadow: inset 3px 0 0 var(--accent); }
@@ -645,7 +642,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
     /* Library on top, queue below — each scrolls on its own, page never scrolls. */
     main { display: flex; flex-direction: column; }
     .sidebar { border-right: none; border-bottom: 1px solid #222; max-height: 40vh; flex: none; }
-    .queue { flex: 1; }
+    .right { flex: 1; min-height: 0; }
     /* Keep transport + seek on one compact row; now-playing wraps above it. */
     footer { flex-wrap: wrap; gap: 4px 10px; padding: 6px 12px; padding-bottom: max(6px, env(safe-area-inset-bottom, 6px)); }
     .now { flex: 1 1 100%; order: 1; }
@@ -670,12 +667,17 @@ const PLAYER_HTML = `<!DOCTYPE html>
       <div class="crumbs" id="crumbs">Loading…</div>
       <div id="browser"></div>
     </div>
-    <div class="queue">
+    <div class="right">
+      <div class="tabs" id="tabs"></div>
       <div class="queue-head">
-        <h2 id="queueTitle">Queue</h2>
-        <button id="clearQueue" class="qclear" title="Clear queue">Clear</button>
+        <h2 id="viewedTitle">default</h2>
+        <div style="display:flex;gap:6px">
+          <button id="playAll" class="qclear" title="Play this playlist">▶ Play</button>
+          <button id="clearPl" class="qclear" title="Clear this playlist">Clear</button>
+          <button id="deletePl" class="qclear" title="Delete this playlist" style="display:none">🗑</button>
+        </div>
       </div>
-      <div id="queue"><div class="empty">Queue is empty. Play something here, or ask the model to.</div></div>
+      <div class="tracklist" id="tracklist"></div>
     </div>
   </main>
   <footer>
@@ -704,9 +706,18 @@ const audio = $('audio');
 // Derive our mount point from the URL the browser actually loaded, so every
 // request goes back to the same origin/path the page was served from.
 const BASE = location.pathname.replace(/\\/player$/, '');
-let tracks = [];       // the shared server queue (Track[])
-let order = [];        // playback order: indices into tracks
-let curTI = -1;        // true index currently loaded into <audio>
+const enc = encodeURIComponent;
+
+// Two distinct notions: the VIEWED playlist (the selected tab) and the PLAYING
+// playlist (server-side playback). Selecting a tab only changes the view — it
+// never touches playback. Whatever is playing keeps playing until you click a
+// track in a tab. They can be the same or different playlists.
+let viewed = 'default';       // selected tab (viewed playlist)
+let viewedTracks = [];        // stored paths of the viewed playlist
+let plNames = ['default'];    // tab names
+let pb = { playlist: null, tracks: [], current: -1, serial: -1, playSerial: -1, paused: true, pauseTime: 0 };
+let order = [];               // playback order (indices into pb.tracks) for shuffle
+let curTI = -1;               // index in pb.tracks currently loaded into <audio>
 let seenSerial = -1, seenPlay = -1;
 let shuffle = false, repeat = false;
 
@@ -715,41 +726,94 @@ const fmt = (s) => {
   s = Math.floor(s);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 };
-const streamUrl = (t) => BASE + '/stream?path=' + encodeURIComponent(t.path);
+const streamUrl = (t) => BASE + '/stream?path=' + enc(t.path);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
-
+const titleOf = (p) => (String(p).split('/').pop() || p).replace(/\\.[^.]+$/, '');
 async function getJSON(u, opts) { const r = await fetch(u, opts); return r.json(); }
-const post = (u) => getJSON(BASE + u, { method: 'POST' });
 
-function rebuildOrder() {
-  order = tracks.map((_, i) => i);
-  if (shuffle) {
-    for (let i = order.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [order[i], order[j]] = [order[j], order[i]];
-    }
-    const at = order.indexOf(curTI);
-    if (at > 0) [order[0], order[at]] = [order[at], order[0]];
+// ── playlist tabs ──
+async function loadTabs() { try { plNames = await getJSON(BASE + '/api/playlists'); } catch (e) {} renderTabs(); }
+function renderTabs() {
+  const host = $('tabs');
+  host.innerHTML = '';
+  plNames.forEach((name) => {
+    const el = document.createElement('div');
+    el.className = 'tab' + (name === viewed ? ' on' : '');
+    // A ● marks the playlist that is currently PLAYING (may differ from viewed).
+    el.innerHTML = (pb.playlist === name ? '<span class="dot">●</span>' : '') + '<span>' + esc(name) + '</span>';
+    el.onclick = () => selectTab(name);
+    host.appendChild(el);
+  });
+  const add = document.createElement('div');
+  add.className = 'tab add';
+  add.textContent = '＋';
+  add.title = 'New playlist';
+  add.onclick = createPlaylistUI;
+  host.appendChild(add);
+}
+async function selectTab(name) { viewed = name; await renderViewed(); renderTabs(); }
+
+// ── viewed playlist (the selected tab) ──
+async function renderViewed() {
+  let pl = { name: viewed, tracks: [] };
+  try { pl = await getJSON(BASE + '/api/playlist/get?name=' + enc(viewed)); } catch (e) {}
+  viewed = pl.name || viewed;
+  viewedTracks = pl.tracks || [];
+  $('viewedTitle').textContent = viewed + (viewedTracks.length ? ' · ' + viewedTracks.length : '');
+  $('deletePl').style.display = viewed === 'default' ? 'none' : '';
+  const host = $('tracklist');
+  host.innerHTML = '';
+  if (!viewedTracks.length) {
+    host.innerHTML = '<div class="empty">Empty playlist. Add tracks from the library, or ask the model to.</div>';
+    return;
   }
+  viewedTracks.forEach((p, i) => {
+    // Highlight the row only if this playlist is the one actually playing.
+    const playingHere = pb.playlist === viewed && i === pb.current;
+    const el = document.createElement('div');
+    el.className = 'track' + (playingHere ? ' active' : '');
+    el.innerHTML = '<span class="num">' + (i + 1) + '</span>' +
+      '<span class="t">' + esc(titleOf(p)) + '</span>' +
+      '<button class="qx" title="Remove">✕</button>';
+    el.querySelector('.t').onclick = () => playViewed(i);
+    el.querySelector('.num').onclick = () => playViewed(i);
+    el.querySelector('.qx').onclick = (e) => { e.stopPropagation(); removeFromViewed(i); };
+    host.appendChild(el);
+  });
 }
 
-function renderQueue() {
-  const q = $('queue');
-  $('queueTitle').textContent = tracks.length ? 'Queue · ' + tracks.length : 'Queue';
-  if (!tracks.length) { q.innerHTML = '<div class="empty">Queue is empty. Play something here, or ask the model to.</div>'; return; }
-  q.innerHTML = '';
-  tracks.forEach((t, i) => {
-    const el = document.createElement('div');
-    el.className = 'track' + (i === curTI ? ' active' : '');
-    el.innerHTML = '<span class="num">' + (i + 1) + '</span>' +
-      '<span class="t">' + esc(t.title) + '</span>' +
-      '<span class="al">' + esc(t.album) + '</span>' +
-      '<button class="qx" title="Remove">✕</button>';
-    el.querySelector('.t').onclick = () => playIndex(i);
-    el.querySelector('.num').onclick = () => playIndex(i);
-    el.querySelector('.qx').onclick = (e) => { e.stopPropagation(); removeIndex(i); };
-    q.appendChild(el);
-  });
+// Play the VIEWED playlist from the given index — this is what switches playback.
+async function playViewed(index) { applyPB(await getJSON(BASE + '/api/player/play?name=' + enc(viewed) + '&index=' + index)); }
+async function removeFromViewed(i) {
+  await getJSON(BASE + '/api/playlist/remove?name=' + enc(viewed) + '&index=' + i);
+  await renderViewed();
+}
+async function clearViewed() {
+  if (!confirm('Clear playlist "' + viewed + '"?')) return;
+  await getJSON(BASE + '/api/playlist/clear?name=' + enc(viewed));
+  await renderViewed();
+}
+async function createPlaylistUI() {
+  const name = prompt('New playlist name:');
+  if (!name || !name.trim()) return;
+  await getJSON(BASE + '/api/playlist/create?name=' + enc(name.trim()));
+  await loadTabs();
+  await selectTab(name.trim());
+}
+async function deleteViewed() {
+  if (viewed === 'default') return;
+  if (!confirm('Delete playlist "' + viewed + '"?')) return;
+  await getJSON(BASE + '/api/playlist/delete?name=' + enc(viewed));
+  viewed = 'default';
+  await loadTabs();
+  await renderViewed();
+}
+// Add a library file/folder to the VIEWED playlist; optionally start playing it.
+async function addToViewed(path, play) {
+  const startIdx = viewedTracks.length;
+  await getJSON(BASE + '/api/playlist/add?name=' + enc(viewed) + '&path=' + enc(path));
+  await renderViewed();
+  if (play) await playViewed(startIdx);
 }
 
 // Lock-screen / Control-Center metadata (also what keeps iOS happy in the
@@ -771,55 +835,68 @@ function updatePosition() {
   try { ms.setPositionState({ duration: audio.duration, playbackRate: audio.playbackRate || 1, position: audio.currentTime }); } catch (e) {}
 }
 
-// Load + play a specific true index locally.
+function rebuildOrder() {
+  order = pb.tracks.map((_, i) => i);
+  if (shuffle) {
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    const at = order.indexOf(curTI);
+    if (at > 0) [order[0], order[at]] = [order[at], order[0]];
+  }
+}
+
+// Load + play a track from the PLAYING playlist snapshot locally.
 function loadAndPlay(ti) {
-  const t = tracks[ti];
+  const t = pb.tracks[ti];
   if (!t) return;
   curTI = ti;
   audio.src = streamUrl(t);
   $('nowTitle').textContent = t.title;
-  $('nowAlbum').textContent = t.album;
+  $('nowAlbum').textContent = (pb.playlist ? pb.playlist + ' · ' : '') + (t.album || '');
   document.title = t.title + ' · music';
-  renderQueue();
   setMetadata(t);
   // Browsers may block autoplay without a gesture; if so the user just presses ▶.
   audio.play().catch(() => {});
+  renderViewed();
 }
 
-// Adopt a server queue snapshot. If the list changed, re-render; if a new play
-// command was issued (playSerial bumped), jump to and play the server's current.
-function applyState(st) {
+// Adopt a server playback snapshot. If the playing list changed, rebuild order;
+// if a new play command was issued (playSerial bumped), jump to and play it.
+function applyPB(st) {
   const listChanged = st.serial !== seenSerial;
   const playChanged = st.playSerial !== seenPlay;
   seenSerial = st.serial; seenPlay = st.playSerial;
-  if (listChanged) { tracks = st.tracks || []; rebuildOrder(); renderQueue(); }
+  pb = st;
+  if (listChanged) { rebuildOrder(); if (pb.playlist === viewed) renderViewed(); }
   if (playChanged) {
-    if (st.current >= 0 && st.current < tracks.length) {
+    if (st.current >= 0 && st.tracks[st.current]) {
       if (!order.includes(st.current)) rebuildOrder();
       loadAndPlay(st.current);
-    } else { audio.pause(); audio.removeAttribute('src'); curTI = -1; renderQueue(); }
+    } else {
+      audio.pause(); audio.removeAttribute('src'); curTI = -1;
+      $('nowTitle').textContent = 'Nothing playing'; $('nowAlbum').textContent = '';
+    }
   }
+  renderTabs();
 }
+async function refreshPB() { try { applyPB(await getJSON(BASE + '/api/player')); } catch (e) {} }
 
-// All queue mutations go through the server — one shared source of truth.
-async function playIndex(i)   { applyState(await post('/api/queue/play?index=' + i)); }
-async function removeIndex(i) { applyState(await post('/api/queue/remove?index=' + i)); }
-async function clearQueue()   { applyState(await post('/api/queue/clear')); }
-async function addPath(p, play) { applyState(await post('/api/queue/add?play=' + (play ? '1' : '0') + '&path=' + encodeURIComponent(p))); }
-async function refresh()      { try { applyState(await getJSON(BASE + '/api/queue')); } catch (e) {} }
-
+// Move within the already-PLAYING playlist (next/prev), leaving the view alone.
+async function playPBIndex(index) { applyPB(await getJSON(BASE + '/api/player/index?index=' + index)); }
 function next() {
-  if (!tracks.length) return;
+  if (!pb.tracks.length) return;
   const lp = order.indexOf(curTI);
-  if (lp < order.length - 1) playIndex(order[lp + 1]);
-  else if (repeat) playIndex(order[0]);
+  if (lp < order.length - 1) playPBIndex(order[lp + 1]);
+  else if (repeat) playPBIndex(order[0]);
   else audio.pause();
 }
 function prev() {
-  if (!tracks.length) return;
+  if (!pb.tracks.length) return;
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
   const lp = order.indexOf(curTI);
-  if (lp > 0) playIndex(order[lp - 1]);
+  if (lp > 0) playPBIndex(order[lp - 1]);
   else audio.currentTime = 0;
 }
 
@@ -830,10 +907,10 @@ function trackRow(f) {
   el.className = 'row';
   el.innerHTML = '<span class="ic">♪</span><span class="t">' + esc(f.title) + '</span>' +
     '<span class="meta">' + esc(f.album || '') + '</span>' +
-    '<button class="qx" title="Add to queue">＋</button>';
-  el.querySelector('.t').onclick = () => addPath(f.path, true);   // play now (adds + plays)
-  el.querySelector('.ic').onclick = () => addPath(f.path, true);
-  el.querySelector('.qx').onclick = (e) => { e.stopPropagation(); addPath(f.path, false); }; // enqueue
+    '<button class="qx" title="Add to playlist">＋</button>';
+  el.querySelector('.t').onclick = () => addToViewed(f.path, true);   // add to viewed + play
+  el.querySelector('.ic').onclick = () => addToViewed(f.path, true);
+  el.querySelector('.qx').onclick = (e) => { e.stopPropagation(); addToViewed(f.path, false); }; // add only
   return el;
 }
 function actionRow(ic, label, onclick) {
@@ -844,15 +921,15 @@ function actionRow(ic, label, onclick) {
   return el;
 }
 async function openBrowse(path) {
-  const data = await getJSON(BASE + '/api/browse?path=' + encodeURIComponent(path));
+  const data = await getJSON(BASE + '/api/browse?path=' + enc(path));
   const b = $('browser');
   b.innerHTML = '';
   $('crumbs').textContent = path === 'root' ? 'Library' : data.path;
 
   if (path !== 'root') {
     b.appendChild(actionRow('↩', '..', () => { crumbStack.pop(); openBrowse(crumbStack[crumbStack.length - 1] || 'root'); }));
-    b.appendChild(actionRow('▶', 'Play this folder', () => addPath(data.path, true)));
-    b.appendChild(actionRow('＋', 'Queue this folder', () => addPath(data.path, false)));
+    b.appendChild(actionRow('▶', 'Play this folder', () => addToViewed(data.path, true)));
+    b.appendChild(actionRow('＋', 'Add folder to playlist', () => addToViewed(data.path, false)));
   }
   data.dirs.forEach((d) => {
     b.appendChild(actionRow('📁', esc(d.name), () => { crumbStack.push(d.path); openBrowse(d.path); }));
@@ -868,7 +945,7 @@ $('search').addEventListener('input', (e) => {
   const q = e.target.value.trim();
   if (!q) return;
   searchTimer = setTimeout(async () => {
-    const data = await getJSON(BASE + '/api/search?q=' + encodeURIComponent(q));
+    const data = await getJSON(BASE + '/api/search?q=' + enc(q));
     const b = $('browser');
     $('crumbs').textContent = data.tracks.length + ' result(s) for "' + q + '"';
     b.innerHTML = '';
@@ -878,13 +955,15 @@ $('search').addEventListener('input', (e) => {
 });
 
 // ── transport wiring ──
-$('play').onclick = () => { if (!tracks.length) return; if (audio.paused) audio.play().catch(() => {}); else audio.pause(); };
+$('play').onclick = () => { if (!audio.src && !pb.tracks.length) return; if (audio.paused) audio.play().catch(() => {}); else audio.pause(); };
 $('next').onclick = next;
 $('prev').onclick = prev;
 $('shuffle').onclick = () => { shuffle = !shuffle; $('shuffle').classList.toggle('on', shuffle); rebuildOrder(); };
 $('repeat').onclick = () => { repeat = !repeat; $('repeat').classList.toggle('on', repeat); };
 $('vol').oninput = (e) => { audio.volume = e.target.value / 100; };
-$('clearQueue').onclick = clearQueue;
+$('playAll').onclick = () => playViewed(0);
+$('clearPl').onclick = clearViewed;
+$('deletePl').onclick = deleteViewed;
 // Back to the main harness UI. When embedded as the SPA's full-screen overlay,
 // ask the parent to close it; otherwise fall back to history / harness root.
 $('back').onclick = () => {
@@ -927,14 +1006,17 @@ audio.addEventListener('timeupdate', () => {
 audio.addEventListener('loadedmetadata', () => { $('dur').textContent = fmt(audio.duration); updatePosition(); });
 $('seek').addEventListener('input', (e) => { if (audio.duration) audio.currentTime = (e.target.value / 1000) * audio.duration; });
 
-// ── boot: a deep-link ?path= enqueues + plays; then poll the shared queue so
-// tracks the model adds while the page is open appear (and play) automatically.
+// ── boot: show the tabs + the default playlist, adopt current playback, then a
+// deep-link ?path= adds to the viewed playlist and plays. Poll playback so plays
+// the model issues while the page is open are reflected (and heard) here too.
 (async () => {
+  await loadTabs();
+  await selectTab('default');
+  await refreshPB();
   const path = new URLSearchParams(location.search).get('path');
-  if (path) { try { await addPath(path, true); } catch (e) { console.error('deep-link failed', e); } }
-  else { await refresh(); }
+  if (path) { try { await addToViewed(path, true); } catch (e) { console.error('deep-link failed', e); } }
   try { await openBrowse('root'); } catch (e) { console.error('browse failed', e); }
-  setInterval(refresh, 2000);
+  setInterval(refreshPB, 2000);
 })();
 </script>
 </body>
@@ -1002,99 +1084,176 @@ export function setup(cfg: PluginConfig<MusicConfig>) {
   });
 
   registerNativeTool({
-    name: 'music_browse',
-    description: 'Browse the music library. Pass "root" for the configured library folders, or a full directory path to list its sub-folders and audio files.',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Directory path to browse, or "root" for the top level.' },
-      },
-      required: [],
-    },
-    execute: async ({ path }: { path?: string }) =>
-      JSON.stringify(await browseDir(path ?? 'root', await dirs()), null, 2),
-  });
-
-  registerNativeTool({
-    name: 'music_search',
-    description: 'Search the library for audio files whose path/name matches a query.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search term (artist, album, or track name).' },
-        limit: { type: 'number', description: 'Max results (default 25).' },
-      },
-      required: ['query'],
-    },
-    execute: async ({ query, limit = 25 }: { query: string; limit?: number }) => {
-      const hits = await searchFiles(query, await dirs(), limit);
-      if (!hits.length) return `No matches found for "${query}".`;
-      return JSON.stringify(hits, null, 2);
-    },
-  });
-
-  registerNativeTool({
     name: 'music_play',
-    description: 'Play music in the browser. Adds the track/folder to the shared playback queue and starts playing from there (the queue keeps any tracks already in it). Give a single file or a folder (added recursively). Returns the player URL to open.',
+    description: 'Play music in the browser. Adds the track/folder (recursively) to a playlist and starts playing that playlist from the first added track. Uses the "default" playlist if none is named. Returns the player URL to open.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Full path to a music file or a directory to add and play.' },
+        playlist: { type: 'string', description: 'Playlist to add to and play (default: "default").' },
       },
       required: ['path'],
     },
-    execute: async ({ path }: { path: string }) => {
-      const tracks = await buildPlaylist(path, await dirs());
+    execute: async ({ path, playlist }: { path: string; playlist?: string }) => {
+      const allowed = await dirs();
+      const tracks = await buildPlaylist(path, allowed);
       if (!tracks.length) return `Nothing playable at "${path}" (or it is outside the allowed dirs).`;
-      const state = queueEnqueue(tracks, true);
+      const pl = await addToPlaylist(playlist, tracks.map((t) => t.path));
+      const startAt = Math.max(0, pl.tracks.length - tracks.length);
+      const state = await playPlaylistFrom(pl.name, startAt, allowed);
       const url = `${playerBase()}/player`;
-      return `Added ${tracks.length} track(s) and started playing from there. Queue now has ${state.tracks.length} track(s).\nOpen/keep the player at: ${url}`;
+      return `Added ${tracks.length} track(s) to playlist "${pl.name}" and started playing it (${state.tracks.length} track(s) total).\nOpen/keep the player at: ${url}`;
+    },
+  });
+
+  // ── playlist management tools ──────────────────────────────────────────────
+  // Named, persisted playlists. Every tool takes an optional `playlist` name and
+  // falls back to "default" (created on first use) when none is given.
+
+  registerNativeTool({
+    name: 'music_playlists',
+    description: 'List the names of all saved playlists.',
+    parameters: { type: 'object', properties: {}, required: [] },
+    execute: async () => {
+      const names = await listPlaylists();
+      return JSON.stringify(names, null, 2);
     },
   });
 
   registerNativeTool({
-    name: 'music_queue_add',
-    description: 'Add a track or folder to the end of the shared playback queue WITHOUT interrupting what is currently playing. Use this to queue up music for later.',
+    name: 'music_playlist_show',
+    description: 'Show the tracks in a saved playlist. Uses the "default" playlist if no name is given.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Full path to a music file or a directory to enqueue.' },
+        playlist: { type: 'string', description: 'Playlist name (default: "default").' },
       },
-      required: ['path'],
+      required: [],
     },
-    execute: async ({ path }: { path: string }) => {
-      const tracks = await buildPlaylist(path, await dirs());
-      if (!tracks.length) return `Nothing playable at "${path}" (or it is outside the allowed dirs).`;
-      const state = queueEnqueue(tracks, false);
-      return `Queued ${tracks.length} track(s). Queue now has ${state.tracks.length} track(s).`;
-    },
-  });
-
-  registerNativeTool({
-    name: 'music_queue_show',
-    description: 'Show the current shared playback queue and which track is playing.',
-    parameters: { type: 'object', properties: {}, required: [] },
-    execute: async () => {
-      const s = queueSnapshot();
-      if (!s.tracks.length) return 'The queue is empty.';
+    execute: async ({ playlist }: { playlist?: string }) => {
+      const tracks = await getPlaylistTracks(playlist, await dirs());
+      const name = safePlaylistName(playlist);
+      if (!tracks.length) return `Playlist "${name}" is empty.`;
       return JSON.stringify({
-        count: s.tracks.length,
-        nowPlaying: s.current >= 0 ? s.tracks[s.current]?.title : null,
-        tracks: s.tracks.map((t, i) => ({ i, title: t.title, album: t.album, playing: i === s.current })),
+        playlist: name,
+        count: tracks.length,
+        tracks: tracks.map((t, i) => ({ i, title: t.title, album: t.album, path: t.path })),
       }, null, 2);
     },
   });
 
   registerNativeTool({
-    name: 'music_queue_clear',
-    description: 'Empty the shared playback queue and stop playback.',
-    parameters: { type: 'object', properties: {}, required: [] },
-    execute: async () => { queueClear(); return 'Queue cleared.'; },
+    name: 'music_playlist_create',
+    description: 'Create a new empty playlist with the given name (overwrites an existing one of the same name to empty).',
+    parameters: {
+      type: 'object',
+      properties: {
+        playlist: { type: 'string', description: 'Name for the new playlist.' },
+      },
+      required: ['playlist'],
+    },
+    execute: async ({ playlist }: { playlist: string }) => {
+      const pl = await createPlaylist(playlist);
+      return `Created playlist "${pl.name}".`;
+    },
+  });
+
+  registerNativeTool({
+    name: 'music_playlist_delete',
+    description: 'Delete a saved playlist by name. The "default" playlist cannot be deleted.',
+    parameters: {
+      type: 'object',
+      properties: {
+        playlist: { type: 'string', description: 'Playlist name to delete.' },
+      },
+      required: ['playlist'],
+    },
+    execute: async ({ playlist }: { playlist: string }) => {
+      const name = safePlaylistName(playlist);
+      const deleted = await deletePlaylist(playlist);
+      return deleted ? `Deleted playlist "${name}".`
+        : `Could not delete "${name}" (the default playlist is protected, or it did not exist).`;
+    },
+  });
+
+  registerNativeTool({
+    name: 'music_playlist_add',
+    description: 'Add a track or folder (recursively) to a saved playlist. Persists to disk. Uses the "default" playlist if no name is given, creating it if needed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Full path to a music file or a directory to add.' },
+        playlist: { type: 'string', description: 'Playlist name (default: "default").' },
+      },
+      required: ['path'],
+    },
+    execute: async ({ path, playlist }: { path: string; playlist?: string }) => {
+      const allowed = await dirs();
+      const tracks = await buildPlaylist(path, allowed);
+      if (!tracks.length) return `Nothing playable at "${path}" (or it is outside the allowed dirs).`;
+      const pl = await addToPlaylist(playlist, tracks.map((t) => t.path));
+      syncPlaybackWithPlaylist(pl.name, resolvePlaylistTracks(pl, allowed));
+      return `Added ${tracks.length} track(s) to playlist "${pl.name}". It now has ${pl.tracks.length} track(s).`;
+    },
+  });
+
+  registerNativeTool({
+    name: 'music_playlist_remove',
+    description: 'Remove the track at a given 0-based index from a saved playlist. Uses the "default" playlist if no name is given.',
+    parameters: {
+      type: 'object',
+      properties: {
+        index: { type: 'number', description: '0-based index of the track to remove (see music_playlist_show).' },
+        playlist: { type: 'string', description: 'Playlist name (default: "default").' },
+      },
+      required: ['index'],
+    },
+    execute: async ({ index, playlist }: { index: number; playlist?: string }) => {
+      const pl = await removeFromPlaylist(playlist, index);
+      syncPlaybackWithPlaylist(pl.name, resolvePlaylistTracks(pl, await dirs()));
+      return `Playlist "${pl.name}" now has ${pl.tracks.length} track(s).`;
+    },
+  });
+
+  registerNativeTool({
+    name: 'music_playlist_clear',
+    description: 'Remove all tracks from a saved playlist. Uses the "default" playlist if no name is given.',
+    parameters: {
+      type: 'object',
+      properties: {
+        playlist: { type: 'string', description: 'Playlist name (default: "default").' },
+      },
+      required: [],
+    },
+    execute: async ({ playlist }: { playlist?: string }) => {
+      const pl = await clearPlaylist(playlist);
+      syncPlaybackWithPlaylist(pl.name, []);
+      return `Cleared playlist "${pl.name}".`;
+    },
+  });
+
+  registerNativeTool({
+    name: 'music_playlist_play',
+    description: 'Start playing a saved playlist from its first track. Uses the "default" playlist if no name is given. Returns the player URL.',
+    parameters: {
+      type: 'object',
+      properties: {
+        playlist: { type: 'string', description: 'Playlist name (default: "default").' },
+      },
+      required: [],
+    },
+    execute: async ({ playlist }: { playlist?: string }) => {
+      const name = safePlaylistName(playlist);
+      const state = await playPlaylistFrom(playlist, 0, await dirs());
+      if (!state.tracks.length) return `Playlist "${name}" is empty (nothing to play).`;
+      const url = `${playerBase()}/player`;
+      return `Playing playlist "${name}" (${state.tracks.length} track(s)) from the top.\nOpen/keep the player at: ${url}`;
+    },
   });
 
   registerNativeTool({
     name: 'music_player_ui',
-    description: 'Return the URL of the browser music player, which shows the shared queue. Optionally pass a path to add+play it when the player opens.',
+    description: 'Return the URL of the browser music player, which shows playlists as tabs. Optionally pass a path to add+play it when the player opens.',
     parameters: {
       type: 'object',
       properties: {
