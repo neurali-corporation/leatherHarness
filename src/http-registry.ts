@@ -16,8 +16,18 @@ export function registerHttpRoute(prefix: string, handler: HttpHandler) {
   routes.push({ prefix, handler });
 }
 
+/**
+ * Register an HTTP route for a plugin using the default naming convention:
+ * `/api/plugin/<pluginName>`. Matches the exact path or anything below it.
+ * This is the standard way for plugins to expose HTTP APIs.
+ */
+export function registerPluginRoute(pluginName: string, handler: HttpHandler) {
+  const prefix = `/api/plugin/${pluginName}`;
+  registerHttpRoute(prefix, handler);
+}
+
 export function matchRoute(pathname: string): HttpHandler | undefined {
   return routes.find((r) => pathname === r.prefix || pathname.startsWith(r.prefix + '/'))?.handler;
 }
 
-export default { registerHttpRoute, matchRoute };
+export default { registerHttpRoute, registerPluginRoute, matchRoute };

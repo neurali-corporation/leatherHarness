@@ -19,7 +19,7 @@ interface QueueState {
 
 // The player UI + streaming routes are mounted here on the main harness server
 // (see MOUNT in plugins/music/index.ts).
-const BASE = '/music';
+const BASE = '/api/plugin/music';
 
 const C = {
   bg: '#0a0a0a',

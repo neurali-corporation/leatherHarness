@@ -8,18 +8,16 @@ import { hasTool, getTool, toolSchemas } from './registry.ts';
 // (other `.md` files in the same directory), we append a one-line mention of
 // their names so the model knows it can pull them in via read_memo on demand.
 async function readMemoContent(config: any): Promise<string> {
-  const p: string | undefined = config.pluginConfig?.memo?.path;
-  const memoPath = p ? p.replace(/^~/, homedir()) : resolvePath(homedir(), '.config/leatherHarness/plugins/memo');
+  const memoDir = resolvePath(homedir(), '.config/leatherHarness/plugins/memo');
 
   let main = '';
-  try { main = await readFile(memoPath, 'utf8'); } catch (_) {}
+  try { main = await readFile(memoDir, 'utf8'); } catch (_) {}
 
   let subs: string[] = [];
   try {
-    const entries = await readdir(dirname(memoPath));
-    const mainBase = basename(memoPath);
+    const entries = await readdir(memoDir);
     subs = entries
-      .filter(f => f.endsWith('.md') && f !== mainBase)
+      .filter(f => f.endsWith('.md'))
       .map(f => f.slice(0, -3))
       .sort();
   } catch (_) {}

@@ -1,16 +1,17 @@
 import { registerNativeTool } from '../../src/registry.ts';
-import { registerHttpRoute } from '../../src/http-registry.ts';
+import { registerPluginRoute } from '../../src/http-registry.ts';
 import { registerUiIcon } from '../../src/ui-registry.ts';
 import { harnessBaseUrl } from '../../src/runtime.ts';
 import type { PluginConfig } from '../../src/plugin-loader.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createReadStream, statSync } from 'node:fs';
-import { stat, readdir } from 'node:fs/promises';
-import { resolve as resolvePath, extname, basename, dirname, sep } from 'node:path';
+import { stat, readdir, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
+import { resolve as resolvePath, extname, basename, dirname, sep, join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
 
 // Path the player UI + streaming routes are mounted at on the main harness server.
-const MOUNT = '/music';
+const MOUNT = '/api/plugin/music';
 
 interface MusicConfig {
   allowedDirs?: string[];
@@ -40,6 +41,157 @@ export interface Track {
   title: string;
   /** Containing directory name — used as an album-ish grouping in the UI. */
   album: string;
+}
+
+// ── playlist storage ─────────────────────────────────────────────────────────
+// Playlists are persisted on disk inside the plugin's own directory so they
+// survive restarts. If no playlist exists yet, a "default" playlist is created
+// on first use. Each playlist is a JSON file containing an ordered list of
+// track paths (strings).
+
+export interface Playlist {
+  name: string;
+  tracks: string[];  // absolute file paths
+}
+
+const PLAYLISTS_DIR = join(homedir(), '.config/leatherHarness/plugins/music/playlists');
+
+async function ensurePlaylistsDir(): Promise<void> {
+  await mkdir(PLAYLISTS_DIR, { recursive: true });
+}
+
+async function listPlaylistFiles(): Promise<string[]> {
+  try {
+    const files = await readdir(PLAYLISTS_DIR);
+    return files.filter(f => f.endsWith('.json')).sort();
+  } catch { return []; }
+}
+
+async function readPlaylistFile(name: string): Promise<Playlist | null> {
+  try {
+    const raw = await readFile(join(PLAYLISTS_DIR, `${name}.json`), 'utf8');
+    const p = JSON.parse(raw) as Playlist;
+    if (p && Array.isArray(p.tracks)) return p;
+    return null;
+  } catch { return null; }
+}
+
+async function writePlaylistFile(name: string, pl: Playlist): Promise<void> {
+  await ensurePlaylistsDir();
+  await writeFile(join(PLAYLISTS_DIR, `${name}.json`), JSON.stringify(pl, null, 2), 'utf8');
+}
+
+async function deletePlaylistFile(name: string): Promise<boolean> {
+  try {
+    await rm(join(PLAYLISTS_DIR, `${name}.json`), { force: true });
+    return true;
+  } catch { return false; }
+}
+
+/** Ensure a "default" playlist exists. Returns the playlist name. */
+async function ensureDefaultPlaylist(): Promise<string> {
+  const existing = await readPlaylistFile('default');
+  if (existing) return 'default';
+  await writePlaylistFile('default', { name: 'default', tracks: [] });
+  return 'default';
+}
+
+export interface PlaylistState {
+  name: string;
+  tracks: string[];
+}
+
+let currentPlaylist: PlaylistState = { name: 'default', tracks: [] };
+
+async function loadCurrentPlaylist(): Promise<PlaylistState> {
+  const name = await ensureDefaultPlaylist();
+  const pl = await readPlaylistFile(name);
+  currentPlaylist = pl || { name, tracks: [] };
+  return currentPlaylist;
+}
+
+async function saveCurrentPlaylist(): Promise<void> {
+  await writePlaylistFile(currentPlaylist.name, currentPlaylist);
+}
+
+/** Get the current playlist name. */
+export function getCurrentPlaylistName(): string {
+  return currentPlaylist.name;
+}
+
+/** Switch the active playlist by name. Creates it if it doesn't exist. */
+export async function switchPlaylist(name: string): Promise<PlaylistState> {
+  const pl = await readPlaylistFile(name);
+  currentPlaylist = pl || { name, tracks: [] };
+  await writePlaylistFile(name, currentPlaylist);
+  return currentPlaylist;
+}
+
+/** Get all available playlist names. */
+export async function listPlaylists(): Promise<string[]> {
+  return listPlaylistFiles();
+}
+
+/** Create a new empty playlist. Returns the playlist. */
+export async function createPlaylist(name: string): Promise<PlaylistState> {
+  const pl: PlaylistState = { name, tracks: [] };
+  await writePlaylistFile(name, pl);
+  return pl;
+}
+
+/** Delete a playlist by name. */
+export async function deletePlaylist(name: string): Promise<boolean> {
+  // Don't allow deleting the "default" playlist
+  if (name === 'default') return false;
+  const deleted = await deletePlaylistFile(name);
+  if (deleted && currentPlaylist.name === name) {
+    await ensureDefaultPlaylist();
+  }
+  return deleted;
+}
+
+/** Add tracks (by path) to the current playlist. Returns the updated playlist. */
+export async function addToPlaylist(paths: string[]): Promise<PlaylistState> {
+  currentPlaylist.tracks.push(...paths);
+  await saveCurrentPlaylist();
+  return currentPlaylist;
+}
+
+/** Remove a track from the current playlist by index. Returns the updated playlist. */
+export async function removeFromPlaylist(index: number): Promise<PlaylistState> {
+  if (index >= 0 && index < currentPlaylist.tracks.length) {
+    currentPlaylist.tracks.splice(index, 1);
+    await saveCurrentPlaylist();
+  }
+  return currentPlaylist;
+}
+
+/** Clear all tracks from the current playlist. */
+export async function clearPlaylist(): Promise<PlaylistState> {
+  currentPlaylist.tracks = [];
+  await saveCurrentPlaylist();
+  return currentPlaylist;
+}
+
+/** Reorder the current playlist (move track at `from` to `to`). */
+export async function reorderPlaylist(from: number, to: number): Promise<PlaylistState> {
+  if (from >= 0 && from < currentPlaylist.tracks.length && to >= 0 && to < currentPlaylist.tracks.length) {
+    const [track] = currentPlaylist.tracks.splice(from, 1);
+    currentPlaylist.tracks.splice(to, 0, track);
+    await saveCurrentPlaylist();
+  }
+  return currentPlaylist;
+}
+
+/** Export the current playlist as a list of Track objects. */
+export async function getPlaylistTracks(allowedDirs: string[]): Promise<Track[]> {
+  const tracks: Track[] = [];
+  for (const path of currentPlaylist.tracks) {
+    if (pathAllowed(path, allowedDirs)) {
+      tracks.push(toTrack(path));
+    }
+  }
+  return tracks;
 }
 
 // ── shared playback queue ────────────────────────────────────────────────────
@@ -344,6 +496,46 @@ export function handleMusicRequest(
     const abs = resolvePath(p);
     if (url.searchParams.get('transcode') === '1') return streamTranscoded(req, res, abs);
     return streamNative(req, res, abs);
+  }
+
+  // ── playlists ──
+  if (route === '/api/playlists') {
+    return listPlaylists().then((names) => json(200, names));
+  }
+  if (route === '/api/playlist/current') {
+    return loadCurrentPlaylist().then((pl) => json(200, pl));
+  }
+  if (route === '/api/playlist/switch') {
+    const name = url.searchParams.get('name');
+    if (!name) return json(400, { error: 'name required' });
+    return switchPlaylist(name).then((pl) => json(200, pl));
+  }
+  if (route === '/api/playlist/create') {
+    const name = url.searchParams.get('name');
+    if (!name) return json(400, { error: 'name required' });
+    return createPlaylist(name).then((pl) => json(200, pl));
+  }
+  if (route === '/api/playlist/delete') {
+    const name = url.searchParams.get('name');
+    if (!name) return json(400, { error: 'name required' });
+    return deletePlaylist(name).then((deleted) => json(200, { deleted }));
+  }
+  if (route === '/api/playlist/add') {
+    const paths = url.searchParams.getAll('path');
+    if (!paths.length) return json(400, { error: 'path required' });
+    return addToPlaylist(paths).then((pl) => json(200, pl));
+  }
+  if (route === '/api/playlist/remove') {
+    const index = parseInt(url.searchParams.get('index') ?? '-1', 10);
+    return removeFromPlaylist(index).then((pl) => json(200, pl));
+  }
+  if (route === '/api/playlist/clear') {
+    return clearPlaylist().then((pl) => json(200, pl));
+  }
+  if (route === '/api/playlist/reorder') {
+    const from = parseInt(url.searchParams.get('from') ?? '-1', 10);
+    const to = parseInt(url.searchParams.get('to') ?? '-1', 10);
+    return reorderPlaylist(from, to).then((pl) => json(200, pl));
   }
 
   // ── shared queue ──
@@ -767,7 +959,7 @@ export function setup(cfg: PluginConfig<MusicConfig>) {
   // are read fresh on every request so config edits take effect live.
   if (!routeRegistered) {
     routeRegistered = true;
-    registerHttpRoute(MOUNT, async (req, res) => {
+    registerPluginRoute('music', async (req, res) => {
       await handleMusicRequest(req, res, await dirs(), MOUNT);
     });
     // Contribute a UI icon that opens the player. Relative URL → same origin the

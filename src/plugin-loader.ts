@@ -1,5 +1,5 @@
 import { readdir, readFile, writeFile, access, mkdir } from 'node:fs/promises';
-import { resolve as resolvePath, dirname } from 'node:path';
+import { resolve as resolvePath, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 
@@ -247,7 +247,6 @@ const BASE_CONFIG = {
   pluginsDir:         './plugins',
   enableModelLauncher: true,
   models:             DEFAULT_MODELS,
-  pluginConfig:       {} as Record<string, unknown>,
 };
 
 function applyEnv(raw: string): string {
@@ -258,19 +257,28 @@ function applyEnv(raw: string): string {
 }
 
 function makePluginConfig<T extends object>(name: string, cfgPath: string): PluginConfig<T> {
+  const pluginConfigDir = dirname(cfgPath);
+  const pluginConfigPath = join(pluginConfigDir, name, 'config.json');
+
   return {
     async get(): Promise<T> {
-      const raw = await readFile(cfgPath, 'utf8');
-      const cfg = JSON.parse(applyEnv(raw));
-      return (cfg.pluginConfig?.[name] ?? {}) as T;
+      try {
+        const raw = await readFile(pluginConfigPath, 'utf8');
+        const cfg = JSON.parse(applyEnv(raw));
+        return cfg as T;
+      } catch {
+        return {} as T;
+      }
     },
     async set(patch: Partial<T>): Promise<void> {
-      const raw = await readFile(cfgPath, 'utf8');
-      const cfg = JSON.parse(raw);
-      cfg.pluginConfig ??= {};
-      cfg.pluginConfig[name] ??= {};
-      Object.assign(cfg.pluginConfig[name], patch);
-      await writeFile(cfgPath, stringifyConfig(cfg), 'utf8');
+      await mkdir(dirname(pluginConfigPath), { recursive: true });
+      let existing: Record<string, unknown> = {};
+      try {
+        const raw = await readFile(pluginConfigPath, 'utf8');
+        existing = JSON.parse(raw);
+      } catch {}
+      const updated = { ...existing, ...patch };
+      await writeFile(pluginConfigPath, stringifyConfig(updated), 'utf8');
     },
   };
 }
@@ -297,20 +305,10 @@ export async function loadPlugins(pluginsDir: string, cfgPath: string): Promise<
 
   const subdirs = entries.filter(e => e.isDirectory());
 
-  // If config.json is missing, collect defaults from all plugins and write it
+  // If config.json is missing, write a minimal default
   if (!(await fileExists(cfgPath))) {
     console.log(`No config.json found — generating default at ${cfgPath}`);
-    const pluginConfig: Record<string, unknown> = {};
-    for (const entry of subdirs) {
-      const indexPath = resolvePath(absDir, entry.name, 'index.ts');
-      try {
-        const mod = await import(indexPath) as { defaultConfig?: unknown };
-        if (mod.defaultConfig !== undefined) {
-          pluginConfig[entry.name] = mod.defaultConfig;
-        }
-      } catch { /* plugin may not load without config — that's fine */ }
-    }
-    const cfg = { ...BASE_CONFIG, pluginConfig };
+    const cfg = { ...BASE_CONFIG };
     await writeFile(cfgPath, stringifyConfig(cfg), 'utf8');
     console.log('Default config.json written. Edit it then restart.');
   }

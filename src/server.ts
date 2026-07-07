@@ -10,6 +10,50 @@ import { setListen, noteHost } from './runtime.ts';
 import { uiIconList, runUiIcon } from './ui-registry.ts';
 import { initModelLauncher, resetModelLauncher } from './model-launcher.ts';
 
+// ── secret-based auth (global, with OpenAI-compatible Bearer header) ────────
+const AUTH_COOKIE = 'lh-secret';
+
+// Extensions that are static frontend assets — never gate these (login page needs them)
+const STATIC_EXTS = new Set(['.css', '.js', '.mjs', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot']);
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) return cookies;
+  for (const pair of cookieHeader.split(';')) {
+    const [key, ...rest] = pair.trim().split('=');
+    if (key) cookies[key.trim()] = rest.join('=').trim();
+  }
+  return cookies;
+}
+
+function checkAuth(req: http.IncomingMessage, secret: string | undefined): boolean {
+  if (!secret || secret === '') return true; // no secret configured → allow all
+
+  // 1. Authorization: Bearer <secret> — OpenAI-compatible, works with opencode
+  const auth = req.headers.authorization ?? '';
+  if (auth === `Bearer ${secret}`) return true;
+
+  // 2. Cookie — for browser sessions
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[AUTH_COOKIE] === secret;
+}
+
+function isStaticAsset(pathname: string): boolean {
+  // No extension on the path → check if it's a known static path
+  const ext = pathname.includes('.') ? pathname.slice(pathname.lastIndexOf('.')) : '';
+  return STATIC_EXTS.has(ext);
+}
+
+function authFail(res: http.ServerResponse, redirectToLogin: boolean = false): void {
+  if (redirectToLogin) {
+    res.writeHead(302, { Location: '/auth/login' });
+    res.end();
+  } else {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'authentication required' }));
+  }
+}
+
 // Global stats tracking
 const globalStats = {
   totalRequests: 0,
@@ -78,6 +122,26 @@ async function main() {
 
     // Plugin-mounted routes (e.g. the music player UI + streaming) take precedence.
     const pathname = (req.url ?? '/').split('?')[0];
+
+    // ── secret auth: gate everything except static frontend assets ──
+    if (config.secret && config.secret !== '' && !isStaticAsset(pathname)) {
+      if (!checkAuth(req, config.secret)) {
+        // Allow login endpoint to be accessible without auth
+        if (req.method === 'GET' && pathname.startsWith('/auth/')) {
+          // fall through to login handler
+        } else if (req.method === 'POST' && pathname.startsWith('/auth/')) {
+          // fall through to login handler
+        } else {
+          if (req.method === 'GET' && req.headers.accept?.includes('text/html')) {
+            authFail(res, true);
+          } else {
+            authFail(res, false);
+          }
+          return;
+        }
+      }
+    }
+
     const route = matchRoute(pathname);
     if (route) {
       try {
