@@ -68,6 +68,9 @@ interface Session {
   loading: boolean;
   tokens: TokenUsage | null;
   metrics: SessionMetrics | null;
+  title?: string;       // summarized name; generated after the first exchange
+  loaded?: boolean;     // whether msgs have been fetched from the server
+  updatedAt?: number;   // last-persisted time, for sidebar ordering
 }
 
 const C = {
@@ -113,7 +116,6 @@ function thinkingParams(level: ThinkLevel): Record<string, unknown> {
 export default function App() {
   const [sessions,    setSessions]    = useState<Record<string, Session>>({});
   const [currentId,   setCurrentId]   = useState<string | null>(null);
-  const [counter,     setCounter]     = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isMobile,    setIsMobile]    = useState(() => window.innerWidth < 768);
   const [expanded,    setExpanded]    = useState<Set<string>>(new Set());
@@ -167,6 +169,14 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // One AbortController per session, so stopping one doesn't cancel another.
   const abortRefs      = useRef<Record<string, AbortController>>({});
+  // Mirror of `sessions` for async callbacks (streaming/persist) that would
+  // otherwise close over a stale snapshot.
+  const sessionsRef    = useRef(sessions);
+  sessionsRef.current  = sessions;
+  // Last-persisted signature per session (message count + title), so the save
+  // effect writes whenever either changes — and never re-saves a just-loaded chat.
+  const savedSigRef    = useRef<Record<string, string>>({});
+  const sigOf = (s: Session) => `${s.msgs.length}|${s.title ?? ''}`;
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 768);
@@ -182,13 +192,9 @@ export default function App() {
   }, []);
 
   const createSession = () => {
-    setCounter(c => {
-      const n  = c + 1;
-      const id = `s${n}`;
-      setSessions(prev => ({ ...prev, [id]: { id, msgs: [], input: '', loading: false, tokens: null, metrics: null } }));
-      setCurrentId(id);
-      return n;
-    });
+    const id = `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+    setSessions(prev => ({ ...prev, [id]: { id, msgs: [], input: '', loading: false, tokens: null, metrics: null, loaded: true } }));
+    setCurrentId(id);
     setSidebarOpen(false);
     setTimeout(() => textareaRef.current?.focus(), 0);
   };
@@ -196,27 +202,118 @@ export default function App() {
   const closeSession = (id: string) => {
     abortRefs.current[id]?.abort();
     delete abortRefs.current[id];
+    delete savedSigRef.current[id];
+    // Delete the persisted copy too (ignore errors — it may never have been saved).
+    fetch(`/api/chats/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
     setSessions(prev => {
       const next = { ...prev };
       delete next[id];
-      if (currentId === id) {
-        const remaining = Object.keys(next);
-        setCurrentId(remaining.length ? remaining[0] : null);
-      }
       return next;
     });
+    // Closing the active chat drops back to the harness background — the user
+    // opens another from the sidebar or presses "New". No auto-switch.
+    if (currentId === id) setCurrentId(null);
   };
 
-  const switchSession = (id: string) => {
+  // Resume a chat: if its messages aren't loaded yet (came from the server list as
+  // metadata only), fetch them before switching.
+  const switchSession = async (id: string) => {
+    const s = sessions[id];
+    if (s && !s.loaded) {
+      try {
+        const full = await fetch(`/api/chats/${encodeURIComponent(id)}`).then(r => r.json());
+        const msgs = Array.isArray(full.msgs) ? full.msgs : [];
+        savedSigRef.current[id] = `${msgs.length}|${full.title ?? ''}`; // just loaded — already in sync
+        setSessions(prev => prev[id] ? { ...prev, [id]: { ...prev[id], msgs, title: full.title, loaded: true } } : prev);
+      } catch { /* leave as-is; user can retry */ }
+    }
     setCurrentId(id);
     setSidebarOpen(false);
     setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
+  // Write the current state of a chat back to the server.
+  const persistSession = (id: string) => {
+    const s = sessionsRef.current[id];
+    if (!s || s.msgs.length === 0) return; // don't persist empty chats
+    fetch(`/api/chats/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: s.title ?? 'New chat', msgs: s.msgs }),
+    }).catch(() => {});
+  };
+
+  // Ask the model for a short (3-5 word) name based on the opening exchange.
+  const generateTitle = async (id: string) => {
+    const s = sessionsRef.current[id];
+    if (!s) return;
+    const convo = s.msgs
+      .filter(m => m.kind === 'user' || m.kind === 'assistant')
+      .slice(0, 4)
+      .map(m => `${m.kind}: ${(m as any).content}`)
+      .join('\n')
+      .slice(0, 4000);
+    if (!convo) return;
+    try {
+      const resp = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'any', stream: false,
+          reasoning_effort: 'none', chat_template_kwargs: { enable_thinking: false },
+          messages: [
+            { role: 'system', content: 'Reply with ONLY a short 3-5 word title for the conversation. No quotes, no punctuation at the end, no preamble.' },
+            { role: 'user', content: convo },
+          ],
+        }),
+      });
+      const data = await resp.json();
+      let title = (data?.choices?.[0]?.message?.content ?? '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/["\n]/g, ' ').trim();
+      title = title.split(/\s+/).slice(0, 8).join(' ').slice(0, 60);
+      // Just set the title — the save effect notices the changed signature and
+      // persists it (single source of truth for writes).
+      if (title) setSessions(prev => prev[id] ? { ...prev, [id]: { ...prev[id], title } } : prev);
+    } catch { /* keep the fallback name */ }
+  };
+
+  // Load the saved chat list (metadata only) into the sidebar on startup.
   useEffect(() => {
-    if (Object.keys(sessions).length === 0) createSession();
+    (async () => {
+      let list: any[] = [];
+      try {
+        const r = await fetch('/api/chats');
+        // A server without this route serves the SPA fallback (HTML) → json()
+        // throws; guard so we don't mistake that for "has chats".
+        if (r.ok) { const j = await r.json(); if (Array.isArray(j)) list = j; }
+      } catch { /* offline / old server */ }
+
+      // Populate the sidebar (metadata only). Do NOT auto-create or auto-open a
+      // chat: with no active chat the app shows the harness background, and the
+      // user opens one from the sidebar or presses "New".
+      const loaded: Record<string, Session> = {};
+      for (const m of list) {
+        loaded[m.id] = { id: m.id, msgs: [], input: '', loading: false, tokens: null, metrics: null, title: m.title, loaded: false, updatedAt: m.updatedAt };
+        savedSigRef.current[m.id] = `0|${m.title ?? ''}`; // msgs not loaded yet
+      }
+      setSessions(loaded);
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Persist chats after each completed reply. Commit-driven (not timed off the
+  // stream), so it always sees the final messages. Writes whenever the message
+  // count or title changes, and names the chat from its first exchange.
+  useEffect(() => {
+    for (const s of Object.values(sessions)) {
+      if (!s.loaded || s.loading || s.msgs.length === 0) continue;
+      const sig = sigOf(s);
+      if (savedSigRef.current[s.id] === sig) continue;
+      savedSigRef.current[s.id] = sig;
+      persistSession(s.id);
+      if (!s.title) generateTitle(s.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -305,11 +402,14 @@ export default function App() {
           } else if (ev.t === 'tool_result') {
             pushMsg(sessId, { kind: 'tool_result', id: ev.id, name: ev.name, out: ev.out ?? '' });
           } else if (ev.t === 'delta') {
+            // Deltas now arrive token-by-token (real streaming), so append each
+            // fragment rather than replacing — otherwise only the final token
+            // survives in the bubble.
             if (!assistantStarted) {
               pushMsg(sessId, { kind: 'assistant', content: ev.text ?? '' });
               assistantStarted = true;
             } else {
-              updateLast(sessId, m => m.kind === 'assistant' ? { ...m, content: ev.text ?? '' } : m);
+              updateLast(sessId, m => m.kind === 'assistant' ? { ...m, content: m.content + (ev.text ?? '') } : m);
             }
           } else if (ev.t === 'metrics') {
             patchSession(sessId, {
@@ -344,6 +444,8 @@ export default function App() {
     } finally {
       patchSession(sessId, { loading: false });
       delete abortRefs.current[sessId];
+      // Persistence + auto-naming happen in a commit-driven effect (see below),
+      // so they see the fully-rendered message list rather than racing it here.
     }
   };
 
@@ -480,8 +582,11 @@ export default function App() {
           <button onClick={createSession} style={btnStyle(C)}>+ New Session</button>
         </div>
       )}
-      <div style={{ flexShrink: 0 }}>
-        {Object.values(sessions).map(s => (
+      <div style={{ flexShrink: 0, overflowY: 'auto' }}>
+        {Object.values(sessions)
+          .slice()
+          .sort((a, b) => (b.updatedAt ?? Infinity) - (a.updatedAt ?? Infinity))
+          .map(s => (
           <div
             key={s.id}
             onClick={() => switchSession(s.id)}
@@ -495,7 +600,7 @@ export default function App() {
           >
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 7 }}>
               {s.loading && <span className="busy-dot" style={{ flexShrink: 0, width: 7, height: 7, borderRadius: '50%', background: C.accent }} />}
-              Session {s.id}
+              {s.title || 'New chat'}
             </span>
             <button
               onClick={e => { e.stopPropagation(); closeSession(s.id); }}
@@ -634,7 +739,7 @@ export default function App() {
               style={{ background: 'none', border: 'none', color: C.text, fontSize: 20, cursor: 'pointer', padding: '2px 6px', lineHeight: 1, flexShrink: 0 }}
             >☰</button>
             <span style={{ flex: 1, fontSize: 14, color: C.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {currentId ?? 'leatherHarness'}
+              {current?.title ?? (currentId ? 'New chat' : 'leatherHarness')}
             </span>
             <button onClick={createSession} style={{ ...btnStyle(C), padding: '5px 12px', fontSize: 13 }}>+ New</button>
           </div>
@@ -697,6 +802,7 @@ export default function App() {
               <div ref={messagesEndRef} />
             </div>
 
+            {current ? (<>
             {/* Token bar */}
             <div style={{
               padding: '3px 14px', fontSize: 11, color: C.muted,
@@ -775,6 +881,12 @@ export default function App() {
                 >Send</button>
               )}
             </div>
+            </>
+            ) : (
+              <div style={{ flexShrink: 0, padding: '16px 12px', borderTop: `1px solid ${C.border}`, background: C.surface, display: 'flex', justifyContent: 'center' }}>
+                <button onClick={createSession} style={{ padding: '11px 22px', background: C.accentDim, border: `1px solid ${C.accentBorder}`, color: C.accent, borderRadius: 10, fontSize: 15, fontWeight: 500, cursor: 'pointer' }}>+ New chat</button>
+              </div>
+            )}
 
           </div>
         </div>

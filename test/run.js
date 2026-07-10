@@ -131,9 +131,133 @@ async function testResolveLoop() {
   server.close();
 }
 
+// Multiple tool calls in one round must run concurrently (latency = slowest,
+// not sum) and their `tool` results must be appended in call order so each
+// pairs with its tool_call_id.
+async function testParallelToolExecution() {
+  let running = 0;
+  let maxConcurrent = 0;
+  const slow = (name) => ({
+    name,
+    description: name,
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => {
+      running++;
+      maxConcurrent = Math.max(maxConcurrent, running);
+      await new Promise((r) => setTimeout(r, 100));
+      running--;
+      return name;
+    },
+  });
+  registerNativeTool(slow("slow_a"));
+  registerNativeTool(slow("slow_b"));
+
+  const mockPort = 12346;
+  let toolMessages = null;
+  const server = await startMockLlama(mockPort, (req) => {
+    if (req.messages.length === 1) {
+      return {
+        choices: [{ message: {
+          role: "assistant", content: null,
+          tool_calls: [
+            { id: "a", type: "function", function: { name: "hx__slow_a", arguments: "{}" } },
+            { id: "b", type: "function", function: { name: "hx__slow_b", arguments: "{}" } },
+          ],
+        } }],
+      };
+    }
+    // Second round: capture the tool results the loop fed back upstream.
+    toolMessages = req.messages.filter((m) => m.role === "tool");
+    return { choices: [{ message: { role: "assistant", content: "done", tool_calls: [] } }] };
+  });
+
+  const cfg = { upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` }, maxToolRounds: 5 };
+  const start = Date.now();
+  await resolveRequest({ messages: [{ role: "user", content: "go" }], tools: [] }, cfg);
+  const elapsed = Date.now() - start;
+
+  assert.equal(maxConcurrent, 2, "both tools should run at the same time");
+  assert.ok(elapsed < 190, `two 100ms tools run in parallel should take ~100ms, took ${elapsed}ms`);
+  assert.deepEqual(
+    toolMessages.map((m) => m.tool_call_id),
+    ["a", "b"],
+    "tool results must be appended in call order",
+  );
+  server.close();
+}
+
+// The final answer must reach the caller as multiple incremental deltas (real
+// token streaming), and tool-call arguments split across SSE frames must be
+// reassembled into valid JSON before the tool runs.
+async function testStreamingAnswer() {
+  let echoedArgs = null;
+  registerNativeTool({
+    name: "echo",
+    description: "echo",
+    parameters: { type: "object", properties: { msg: { type: "string" } }, required: [] },
+    execute: async (a) => { echoedArgs = a; return "ok"; },
+  });
+
+  const mockPort = 12360;
+  const server = await startMockLlama(mockPort, (req) => {
+    if (req.messages.length === 1) {
+      return { choices: [{ message: {
+        role: "assistant", content: null,
+        tool_calls: [{ id: "e", type: "function", function: { name: "hx__echo", arguments: '{"msg":"hello world"}' } }],
+      } }] };
+    }
+    return { choices: [{ message: { role: "assistant", content: "The answer is 42.", tool_calls: [] } }] };
+  });
+
+  const deltas = [];
+  const cfg = { upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` }, maxToolRounds: 5 };
+  await resolveRequest(
+    { messages: [{ role: "user", content: "go" }], tools: [] },
+    cfg,
+    (ev) => { if (ev.t === "delta") deltas.push(ev.text); },
+  );
+
+  assert.ok(deltas.length > 1, `answer should stream as multiple deltas, got ${deltas.length}`);
+  assert.equal(deltas.join(""), "The answer is 42.", "streamed deltas must reassemble to the full answer");
+  assert.deepEqual(echoedArgs, { msg: "hello world" }, "tool args split across frames must reassemble to valid JSON");
+  server.close();
+}
+
+// Inline <think>…</think> reasoning must never leak into the streamed answer —
+// the non-streamed path strips it, so streaming must too. Tags straddle the
+// mock's 3-char chunks, so this also exercises cross-chunk tag handling.
+// Regression guard for oh-my-pi edits being corrupted by leaked chain-of-thought.
+async function testStreamingStripsThink() {
+  const mockPort = 12361;
+  const answer = "SWAP 1.=1:\nreal edit body";
+  const server = await startMockLlama(mockPort, () => ({
+    choices: [{ message: {
+      role: "assistant",
+      content: `<think>secret plan the user must not see</think>${answer}`,
+      tool_calls: [],
+    } }],
+  }));
+
+  const deltas = [];
+  const cfg = { upstream: { baseUrl: `http://127.0.0.1:${mockPort}/v1` }, maxToolRounds: 5 };
+  await resolveRequest(
+    { messages: [{ role: "user", content: "edit it" }], tools: [] },
+    cfg,
+    (ev) => { if (ev.t === "delta") deltas.push(ev.text); },
+  );
+
+  const streamed = deltas.join("");
+  assert.equal(streamed, answer, `streamed answer must exclude reasoning, got: ${JSON.stringify(streamed)}`);
+  assert.ok(!streamed.includes("<think>") && !streamed.includes("secret plan"), "no chain-of-thought may leak into the stream");
+  server.close();
+}
+
 (async () => {
   await testNativeRegistration();
   await testChromecastStatusTool();
   await testResolveLoop();
+  await testParallelToolExecution();
+  await testStreamingAnswer();
+  await testStreamingStripsThink();
   console.log("All tests passed");
 })();

@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve as resolvePath, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { loadPlugins, getDiscovery } from './plugin-loader.ts';
@@ -192,6 +192,23 @@ function updateGlobalMetrics(metrics: any) {
 async function main() {
   const configDir = resolvePath(homedir(), '.config', 'leatherHarness');
   const cfgPath = resolvePath(configDir, 'config.json');
+
+  // Persisted web chats: one JSON file per conversation under <config>/chats, so
+  // the web UI can list, resume, rename, and delete them across reloads/devices.
+  const chatsDir = resolvePath(configDir, 'chats');
+  const chatId = (raw: string) => raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+  const chatPath = (id: string) => resolvePath(chatsDir, `${id}.json`);
+  const listChats = async () => {
+    let files: string[] = [];
+    try { files = (await readdir(chatsDir)).filter((f) => f.endsWith('.json')); } catch { return []; }
+    const metas = await Promise.all(files.map(async (f) => {
+      try {
+        const c = JSON.parse(await readFile(resolvePath(chatsDir, f), 'utf8'));
+        return { id: c.id, title: c.title || 'Untitled chat', updatedAt: c.updatedAt || 0, messageCount: Array.isArray(c.msgs) ? c.msgs.length : 0 };
+      } catch { return null; }
+    }));
+    return metas.filter(Boolean).sort((a: any, b: any) => b.updatedAt - a.updatedAt);
+  };
 
   // loadPlugins writes a default config.json if one doesn't exist yet
   const defaultPluginsDir = './plugins';
@@ -452,6 +469,16 @@ async function main() {
         };
 
         const emitFn = isUi ? uiEmit : openaiEmit;
+        // Keep the connection alive during long upstream thinking/generation.
+        // While the model emits only (filtered-out) reasoning, nothing is written
+        // to this stream, so an idle browser/proxy/fetch would drop it mid-think.
+        // SSE comment lines (":" prefix) are ignored by every client but reset
+        // those idle timers.
+        const heartbeat = setInterval(() => {
+          if (!res.writableEnded && res.writable) {
+            try { res.write(': keepalive\n\n'); } catch (e) { logError('chat heartbeat write', e); }
+          }
+        }, 10000);
         try {
           await resolveRequest(json, config, emitFn);
         } catch (e: any) {
@@ -464,6 +491,8 @@ async function main() {
             res.end();
           }
           return;
+        } finally {
+          clearInterval(heartbeat);
         }
         // Only finalize if response is still open
         if (!res.writableEnded && res.writable) {
@@ -566,6 +595,13 @@ async function main() {
           }
         };
 
+        // Heartbeat: keep the connection alive while the model is thinking (see
+        // the chat/completions branch for the rationale). SSE comments are ignored.
+        const heartbeat = setInterval(() => {
+          if (!res.writableEnded && res.writable) {
+            try { res.write(': keepalive\n\n'); } catch (e) { logError('/responses heartbeat write', e); }
+          }
+        }, 10000);
         try {
           await resolveRequest(chatBody, config, emit);
         } catch (e: any) {
@@ -576,6 +612,8 @@ async function main() {
             res.end();
           }
           return;
+        } finally {
+          clearInterval(heartbeat);
         }
 
         if (!res.writableEnded && res.writable) {
@@ -674,6 +712,59 @@ async function main() {
         res.end(JSON.stringify({ error: e.message }));
       }
       return;
+    }
+
+    // ── persisted web chats ──────────────────────────────────────────────────
+    // List all saved chats (metadata only), newest first.
+    if (req.method === 'GET' && pathname === '/api/chats') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(await listChats()));
+      return;
+    }
+    // Fetch / save / delete one chat by id.
+    if (pathname.startsWith('/api/chats/')) {
+      const id = chatId(decodeURIComponent(pathname.slice('/api/chats/'.length)));
+      if (!id) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end('{"error":"bad id"}'); return; }
+
+      if (req.method === 'GET') {
+        try {
+          const data = await readFile(chatPath(id), 'utf8');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(data);
+        } catch {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end('{"error":"not found"}');
+        }
+        return;
+      }
+      if (req.method === 'PUT' || req.method === 'POST') {
+        try {
+          let body = '';
+          for await (const chunk of req) body += chunk;
+          const incoming = body ? JSON.parse(body) : {};
+          const chat = {
+            id,
+            title: typeof incoming.title === 'string' ? incoming.title : 'Untitled chat',
+            msgs: Array.isArray(incoming.msgs) ? incoming.msgs : [],
+            updatedAt: Date.now(),
+          };
+          await mkdir(chatsDir, { recursive: true });
+          await writeFile(chatPath(id), JSON.stringify(chat));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, id, updatedAt: chat.updatedAt }));
+        } catch (e: any) {
+          logError('save chat', e);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+        return;
+      }
+      if (req.method === 'DELETE') {
+        try { await unlink(chatPath(id)); } catch { /* already gone */ }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+        return;
+      }
     }
 
     // OpenAI-compatible model discovery. The harness offers no model selection —

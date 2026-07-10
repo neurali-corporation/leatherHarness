@@ -50,6 +50,15 @@ function esc(s: string): string {
 
 const streamUrl = (t: Track) => `${BASE}/stream?path=${encodeURIComponent(t.path)}`;
 const titleOf = (p: string) => (p.split('/').pop() || p).replace(/\.[^.]+$/, '');
+// Playlist entries are bare paths (no metadata), so use the containing folder as
+// the album/artist line — good enough for the two-row song layout.
+const albumOf = (p: string) => {
+  const parts = p.split('/').filter(Boolean);
+  return parts.length >= 2 ? parts[parts.length - 2] : '';
+};
+
+const MOBILE_QUERY = '(max-width: 700px)';
+const matchesMobile = () => typeof window !== 'undefined' && window.matchMedia(MOBILE_QUERY).matches;
 
 function MusicPlayer({ open, onClose }: UiPluginProps) {
   const [pb, setPb] = useState<PlaybackState>({
@@ -72,6 +81,21 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
   const [browseDirs, setBrowseDirs] = useState<{ name: string; path: string }[]>([]);
   const [browseFiles, setBrowseFiles] = useState<Track[]>([]);
   const [crumbStack, setCrumbStack] = useState<string[]>([]);
+
+  // The library is an on-demand overlay (no persistent sidebar): it starts closed
+  // and is opened via the ☰ toggle or the playlist's "＋ Add" button. isMobile
+  // only controls whether that overlay is full-screen or a left panel.
+  const [isMobile, setIsMobile] = useState(matchesMobile);
+  const [libOpen, setLibOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mq = window.matchMedia(MOBILE_QUERY);
+    const onChange = () => setIsMobile(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const seekRef = useRef<HTMLInputElement | null>(null);
@@ -127,6 +151,9 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
     loadTabs();
     loadViewed(viewed);
     refreshPB();
+    // Load the library root up front — the ☰ button now only toggles the overlay
+    // (it used to trigger this browse), so without it the library opens empty.
+    browseDir('root');
     const interval = setInterval(refreshPB, 2000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -216,20 +243,30 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
     return order;
   };
 
-  const playPBIndex = async (index: number) => {
-    try {
-      applyPB(await (await fetch(`${BASE}/api/player/index?index=${index}`)).json());
-    } catch (e) {
-      console.error('Failed to change track:', e);
-    }
+  // Advance to a track from the CURRENT snapshot immediately and synchronously.
+  // This is critical for iOS: Safari blocks `.play()` on a new src if it happens
+  // after an `await` (e.g. a server round-trip) while backgrounded, so a track
+  // ending in the background would just stop. We swap the src and play in the same
+  // tick as the `ended`/action event, then tell the server fire-and-forget and
+  // adopt its serials so the 2s poll doesn't reload the track.
+  const playLocal = (index: number) => {
+    const a = audioRef.current;
+    const t = pb.tracks[index];
+    if (!a || !t) return;
+    a.src = streamUrl(t);
+    a.play().catch(() => {});
+    fetch(`${BASE}/api/player/index?index=${index}`)
+      .then((r) => r.json())
+      .then((st) => { seenSerialRef.current = st.serial; seenPlayRef.current = st.playSerial; setPb(st); })
+      .catch((e) => console.error('Failed to sync track:', e));
   };
 
   const nextTrack = () => {
     if (pb.tracks.length === 0) return;
     const order = buildOrder();
     const ci = order.indexOf(pb.current);
-    if (ci < order.length - 1) playPBIndex(order[ci + 1]);
-    else if (repeat) playPBIndex(order[0]);
+    if (ci < order.length - 1) playLocal(order[ci + 1]);
+    else if (repeat) playLocal(order[0]);
     else audioRef.current?.pause();
   };
 
@@ -241,7 +278,7 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
     }
     const order = buildOrder();
     const ci = order.indexOf(pb.current);
-    if (ci > 0) playPBIndex(order[ci - 1]);
+    if (ci > 0) playLocal(order[ci - 1]);
     else if (audioRef.current) audioRef.current.currentTime = 0;
   };
 
@@ -266,7 +303,13 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
   };
 
   const handleTimeUpdate = () => {
-    if (audioRef.current) setCurrentTime(audioRef.current.currentTime);
+    const a = audioRef.current;
+    if (!a) return;
+    setCurrentTime(a.currentTime);
+    // Feed the lock-screen scrubber its position.
+    if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession && a.duration && isFinite(a.duration)) {
+      try { navigator.mediaSession.setPositionState({ duration: a.duration, position: a.currentTime, playbackRate: a.playbackRate || 1 }); } catch { /* invalid state mid-load */ }
+    }
   };
   const handleLoadedMetadata = () => {
     if (audioRef.current) setDuration(audioRef.current.duration);
@@ -295,6 +338,10 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
     setSearchQuery(q);
     setTimeout(() => searchMusic(q), 250);
   };
+  // Search results render inside the library panel, so opening search also opens
+  // the library. Closing clears the query so the browse view returns.
+  const openSearch = () => { setSearchOpen(true); setLibOpen(true); };
+  const closeSearch = () => { setSearchOpen(false); setSearchQuery(''); setSearchResults([]); };
 
   const browseDir = async (path: string) => {
     try {
@@ -314,6 +361,43 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
 
   const currentTrack = pb.playlist && pb.current >= 0 ? pb.tracks[pb.current] : null;
 
+  // ── OS media session (lock-screen controls + iOS background playback) ──
+  // Without this, mobile Safari suspends the page in the background and won't let
+  // playback continue or advance between tracks (the async fetch→play on track
+  // end gets blocked). Registering metadata + action handlers marks this as an
+  // active media session so the OS keeps the audio alive and shows lock-screen
+  // controls. Handlers are registered once and dispatch through a ref so they
+  // always invoke the latest transport logic.
+  const transportRef = useRef({ next: nextTrack, prev: prevTrack });
+  transportRef.current = { next: nextTrack, prev: prevTrack };
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    ms.setActionHandler('play', () => { audioRef.current?.play().catch(() => {}); });
+    ms.setActionHandler('pause', () => audioRef.current?.pause());
+    ms.setActionHandler('previoustrack', () => transportRef.current.prev());
+    ms.setActionHandler('nexttrack', () => transportRef.current.next());
+    return () => {
+      for (const a of ['play', 'pause', 'previoustrack', 'nexttrack'] as const) {
+        try { ms.setActionHandler(a, null); } catch { /* unsupported action */ }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    if (currentTrack && 'MediaMetadata' in window) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentTrack.title || titleOf(currentTrack.path),
+        artist: currentTrack.album || '',
+        album: pb.playlist || '',
+      });
+    }
+    navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTrack?.path, pb.playlist, playing]);
+
   const handleClose = () => onClose();
 
   // ── small reusable styles ──
@@ -329,7 +413,7 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
   const libRow = (f: Track, key: number) => (
     <div
       key={key}
-      onClick={() => addToViewed(f.path, true)}
+      onClick={() => { addToViewed(f.path, true); setLibOpen(false); }}
       style={{ padding: '9px 10px', borderRadius: 7, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9, fontSize: 13 }}
     >
       <span style={{ color: C.accent, width: 16, textAlign: 'center' }}>♪</span>
@@ -364,19 +448,42 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
           {/* Header */}
           <header style={{ padding: '14px 20px', background: C.panel, display: 'flex', alignItems: 'center', gap: 14, borderBottom: '1px solid #222', flex: 'none' }}>
             <button onClick={handleClose} style={{ background: C.panel2, border: '1px solid #2a2a2a', color: C.text, fontSize: 16, lineHeight: 1, cursor: 'pointer', width: 34, height: 34, borderRadius: 8, flex: 'none' }} title="Close">←</button>
-            <button onClick={() => browseDir('root')} style={{ background: C.panel2, border: '1px solid #2a2a2a', color: C.text, fontSize: 16, lineHeight: 1, cursor: 'pointer', width: 34, height: 34, borderRadius: 8, flex: 'none' }} title="Library">☰</button>
-            <h1 style={{ fontSize: 16, fontWeight: 600, flex: 1 }}>
-              leather<span style={{ color: C.accent }}>Harness</span> · music
-            </h1>
-            <input type="search" value={searchQuery} onChange={handleSearchChange} placeholder="Search tracks…" style={{ background: C.panel2, border: '1px solid #2a2a2a', color: C.text, padding: '8px 12px', borderRadius: 8, width: 220, outline: 'none' }} />
+            <button onClick={() => setLibOpen((o) => !o)} style={{ background: libOpen ? C.accentDim : C.panel2, border: `1px solid ${libOpen ? C.accentBorder : '#2a2a2a'}`, color: C.text, fontSize: 16, lineHeight: 1, cursor: 'pointer', width: 34, height: 34, borderRadius: 8, flex: 'none' }} title="Toggle library">☰</button>
+            {/* Hide the title on mobile while searching so the field has room. */}
+            {!(searchOpen && isMobile) && (
+              <h1 style={{ fontSize: 16, fontWeight: 600, flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                leather<span style={{ color: C.accent }}>Harness</span> · music
+              </h1>
+            )}
+            {/* Search collapses to an icon; tapping it reveals the input. */}
+            {searchOpen ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: isMobile ? 1 : 'none' }}>
+                <input autoFocus type="search" value={searchQuery} onChange={handleSearchChange} placeholder="Search tracks…" style={{ background: C.panel2, border: '1px solid #2a2a2a', color: C.text, padding: '8px 12px', borderRadius: 8, width: isMobile ? undefined : 220, flex: isMobile ? 1 : 'none', minWidth: 0, outline: 'none' }} />
+                <button onClick={closeSearch} style={{ background: C.panel2, border: '1px solid #2a2a2a', color: C.text, fontSize: 16, lineHeight: 1, cursor: 'pointer', width: 34, height: 34, borderRadius: 8, flex: 'none' }} title="Close search">✕</button>
+              </div>
+            ) : (
+              <button onClick={openSearch} style={{ background: searchQuery ? C.accentDim : C.panel2, border: `1px solid ${searchQuery ? C.accentBorder : '#2a2a2a'}`, color: C.text, fontSize: 16, lineHeight: 1, cursor: 'pointer', width: 34, height: 34, borderRadius: 8, flex: 'none' }} title="Search">🔍</button>
+            )}
           </header>
 
           {/* Main content */}
-          <main style={{ flex: 1, display: 'grid', gridTemplateColumns: '280px 1fr', minHeight: 0 }}>
-            {/* Library sidebar */}
-            <div style={{ background: C.panel, borderRight: '1px solid #222', overflowY: 'auto', padding: 10 }}>
-              <div style={{ fontSize: 12, color: C.muted, padding: '4px 8px 10px', wordBreak: 'break-all' }}>
-                {browsePath === 'root' ? 'Library' : browsePath}
+          <main style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
+            {/* Library is an on-demand overlay (no persistent sidebar): full-screen
+                on mobile, a left panel with a dismissable backdrop on desktop. */}
+            {libOpen && (
+              <div onClick={() => setLibOpen(false)} style={{ position: 'absolute', inset: 0, zIndex: 4, background: isMobile ? 'transparent' : 'rgba(0,0,0,0.5)' }} />
+            )}
+            {libOpen && (
+            <div style={{
+              background: C.panel, borderRight: '1px solid #222', overflowY: 'auto', padding: 10,
+              position: 'absolute', top: 0, bottom: 0, left: 0, zIndex: 5,
+              width: isMobile ? '100%' : 320, maxWidth: '100%',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 4px 10px' }}>
+                <div style={{ fontSize: 12, color: C.muted, wordBreak: 'break-all', flex: 1 }}>
+                  {browsePath === 'root' ? 'Library' : browsePath}
+                </div>
+                <button onClick={() => setLibOpen(false)} style={{ background: C.panel2, border: '1px solid #2a2a2a', color: C.text, fontSize: 15, lineHeight: 1, cursor: 'pointer', width: 30, height: 30, borderRadius: 8, flex: 'none' }} title="Close library">✕</button>
               </div>
               {searchResults.length > 0 ? (
                 searchResults.map((f, i) => libRow(f, i))
@@ -389,7 +496,7 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
                     </div>
                   )}
                   {browsePath !== 'root' && (
-                    <div onClick={() => addToViewed(browsePath, true)} style={{ padding: '9px 10px', borderRadius: 7, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9, fontSize: 13 }}>
+                    <div onClick={() => { addToViewed(browsePath, true); setLibOpen(false); }} style={{ padding: '9px 10px', borderRadius: 7, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9, fontSize: 13 }}>
                       <span style={{ color: C.accent, width: 16, textAlign: 'center' }}>▶</span>
                       <span>Play this folder</span>
                     </div>
@@ -407,9 +514,10 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
                 </>
               )}
             </div>
+            )}
 
             {/* Right column: tabs + viewed playlist */}
-            <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
               {/* Playlist tabs */}
               <div style={{ display: 'flex', gap: 4, padding: '8px 8px 0', overflowX: 'auto', borderBottom: '1px solid #222', flex: 'none' }}>
                 {plNames.map((name) => {
@@ -435,6 +543,7 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
                   {esc(viewed)}{viewedTracks.length > 0 && ` · ${viewedTracks.length}`}
                 </h2>
                 <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={() => setLibOpen(true)} style={{ ...smallBtn, color: C.accent, borderColor: C.accentBorder }} title="Add tracks or folders from the library">＋ Add</button>
                   <button onClick={() => playViewed(0)} style={smallBtn} title="Play this playlist">▶ Play</button>
                   <button onClick={clearViewed} style={smallBtn} title="Clear this playlist">Clear</button>
                   {viewed !== 'default' && <button onClick={deleteViewed} style={smallBtn} title="Delete this playlist">🗑</button>}
@@ -456,9 +565,13 @@ function MusicPlayer({ open, onClose }: UiPluginProps) {
                         onClick={() => playViewed(i)}
                         style={{ padding: '9px 12px', borderRadius: 7, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, background: playingHere ? '#0d2035' : 'transparent', boxShadow: playingHere ? `inset 3px 0 0 ${C.accent}` : 'none' }}
                       >
-                        <span style={{ color: playingHere ? C.accent : C.muted, width: 22, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{i + 1}</span>
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{esc(titleOf(p))}</span>
-                        <button onClick={(e) => { e.stopPropagation(); removeFromViewed(i); }} style={rowBtn} title="Remove from playlist">✕</button>
+                        <span style={{ color: playingHere ? C.accent : C.muted, width: 22, textAlign: 'right', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{i + 1}</span>
+                        {/* Two rows per song: title on top, album/artist beneath. */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: playingHere ? C.accent : C.text, fontSize: 14 }}>{esc(titleOf(p))}</div>
+                          <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.muted, fontSize: 11, marginTop: 2 }}>{esc(albumOf(p)) || '—'}</div>
+                        </div>
+                        <button onClick={(e) => { e.stopPropagation(); removeFromViewed(i); }} style={{ ...rowBtn, flex: 'none' }} title="Remove from playlist">✕</button>
                       </div>
                     );
                   })

@@ -1,0 +1,6 @@
+{
+  "watch": ["src", "plugins"],
+  "ext": "ts,json",
+  "ignore": ["dist-ui/**", "test/**", "**/*.d.ts"],
+  "delay": 300
+}

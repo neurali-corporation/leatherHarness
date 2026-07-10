@@ -1,7 +1,7 @@
 import { registerNativeTool } from '../../src/registry.ts';
 import type { PluginConfig } from '../../src/plugin-loader.ts';
 import { createReadStream, statSync, readFileSync } from 'node:fs';
-import { stat, mkdir, rm } from 'node:fs/promises';
+import { stat, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { resolve as resolvePath, extname } from 'node:path';
 import { spawn } from 'node:child_process';
 import dgram from 'node:dgram';
@@ -777,6 +777,28 @@ function castGetStatus(ip: string): Promise<Record<string, unknown>> {
   });
 }
 
+// ── playback history ──────────────────────────────────────────────────────────
+// Every file successfully cast is appended here (persisted in the plugin's dir)
+// so the model can later recall what's been played via the chromecast_history
+// tool. Capped so it can't grow without bound.
+interface HistoryEntry { path: string; ip: string; audioIndex: number | null; at: string; }
+const HISTORY_FILE = 'history.json';
+const HISTORY_MAX = 500;
+
+async function readHistory(dir: string): Promise<HistoryEntry[]> {
+  try {
+    const list = JSON.parse(await readFile(resolvePath(dir, HISTORY_FILE), 'utf8'));
+    return Array.isArray(list) ? list : [];
+  } catch { return []; }
+}
+
+async function appendHistory(dir: string, entry: HistoryEntry): Promise<void> {
+  const list = await readHistory(dir);
+  list.push(entry);
+  const trimmed = list.length > HISTORY_MAX ? list.slice(-HISTORY_MAX) : list;
+  await writeFile(resolvePath(dir, HISTORY_FILE), JSON.stringify(trimmed, null, 2));
+}
+
 export function setup(cfg: PluginConfig<ChromecastConfig>) {
   function isPathAllowed(target: string, allowedDirs: string[]): boolean {
     const abs = resolvePath(process.cwd(), target);
@@ -939,6 +961,12 @@ export function setup(cfg: PluginConfig<ChromecastConfig>) {
         const { message, sessionId } = await castStream(ip, url, contentType, streamType, castSubtitleUrl);
         console.log(`[chromecast] cast success: ${message} sessionId=${sessionId}`);
         activeSessions.set(absPath, { ip, sessionId, closeServer });
+        // Record what we started playing so the model can recall it later.
+        try {
+          await appendHistory(await cfg.ensureDir(), { path: absPath, ip, audioIndex: audioIndex ?? null, at: new Date().toISOString() });
+        } catch (e: unknown) {
+          console.error(`[chromecast] failed to record history: ${(e as Error).message}`);
+        }
         return `${message}\nHandle (use to stop): ${absPath}`;
       } catch (e: unknown) {
         console.error(`[chromecast] cast failed: ${(e as Error).message}`);
@@ -964,6 +992,24 @@ export function setup(cfg: PluginConfig<ChromecastConfig>) {
         }
       }));
       return JSON.stringify(sessions, null, 2);
+    },
+  });
+
+  registerNativeTool({
+    name: 'chromecast_history',
+    description: 'List media files previously cast to Chromecast devices, most recent first. Returns a JSON array of { path, ip, audioIndex, at } where `at` is an ISO timestamp. Optionally pass `limit` to cap how many recent entries are returned.',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Optional. Maximum number of entries to return (most recent first).' },
+      },
+      required: [],
+    },
+    execute: async ({ limit }: { limit?: number }) => {
+      const history = (await readHistory(await cfg.ensureDir())).slice().reverse(); // most recent first
+      const entries = limit && limit > 0 ? history.slice(0, limit) : history;
+      if (!entries.length) return 'No Chromecast playback history yet.';
+      return JSON.stringify(entries, null, 2);
     },
   });
 

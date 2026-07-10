@@ -583,9 +583,8 @@ Key points:
 | `chromecast` | `discover_chromecasts`, `list_audio_tracks`, `play_on_chromecast`, `stop_chromecast` | Cast local media to Chromecast devices. HLS transcode, audio track selection, subtitles, range requests |
 | `fileOps` | `ls`, `cat`, `list_allowed_dirs`, `suggest_start_dir`, `dir_tree`, `cp`, `mv`, `rename`, `list_write_dirs`, `delete_file` (opt-in) | File browsing and manipulation, sandboxed to configured directories |
 | `memo` | `read_memo`, `write_memo`, `append_memo`, `list_memos` | Persistent markdown memory. Main memo injected into every system prompt; sub-memos on demand |
-| `playwright_scraper` | (via playwright) | Headless Chromium for JS-rendered pages |
 | `wiki_search` | (via fetch) | Wikipedia full-article fetch |
-| `scraper` | `scrape` | Headless Chromium page scraper — renders JS, returns full visible text |
+| `scraper` | `scrape` | Headless Chromium page scraper — renders JS, returns full HTML with `<script>`/`<style>` stripped |
 | `clock` | `clock` | Returns current ISO timestamp |
 | `music` | `music_list_dirs`, `music_info`, `music_browse`, `music_search`, `music_play`, `music_queue_add`, `music_queue_show`, `music_queue_clear`, `music_player_ui` | Browser-based music player with shared queue, streaming, and playlist management |
 | `fileSearch` | — | File search plugin |
@@ -626,6 +625,7 @@ introspection.
 | `src/http-registry.ts` | HTTP route registry for plugin-mounted endpoints (e.g. `/music`). |
 | `src/ui-registry.ts` | UI icon registry for plugin-contributed toolbar icons. |
 | `src/runtime.ts` | Shared view of the harness listen address. Plugins build absolute URLs using the observed Host header. |
+| `src/log.ts` | Verbose error logging — prints error name, message, full stack, cause chain, and extra props (code/errno/syscall). |
 | `src/ui/App.tsx` | React chat UI — multi-session, SSE streaming, expandable tool calls/results, reasoning display, global + upstream metrics panels. |
 | `vite.config.ts` | Vite build config targeting `dist-ui/`. Dev server proxies `/v1` to the harness. |
 
@@ -730,11 +730,15 @@ npm test
 | `test/e2e_chat.js` | Full chat request through harness to mock LLM |
 | `test/e2e_ui.js` | UI icon registry (registration, action execution, guards) |
 | `test/e2e_music.js` | Music plugin: library walking, playlists, browsing, searching, streaming, queue, route mounting, host header handling |
+| `test/e2e_stream.js` | SSE streaming end-to-end |
+| `test/e2e_responses.js` | HTTP response shape and edge cases |
+| `test/e2e_scrape.js` | Scrape plugin full HTML output |
 | `test/compaction.js` | Conversation compaction logic (incl. always keeping a `user` turn) |
 | `test/tool-fallback.js` | Retry without tools on a tool-parser `400` |
 | `test/auto-restart.js` | Backend crash → auto-restart; intentional stop stays down |
 | `test/model-launcher.js` | Launcher script parsing, start/stop/switch, model HTTP routes |
+| `test/discovery.js` | Config templating + discovery surface |
+| `test/metrics.js` | Global metrics tracking |
 | `test/sse-robustness.js` | SSE stream resilience |
 | `test/upstream-metrics.js` | Upstream metrics proxy |
-| `test/metrics.js` | Global metrics tracking |
 | `test/mockLlama.js` | Mock LLM server utility for tests |

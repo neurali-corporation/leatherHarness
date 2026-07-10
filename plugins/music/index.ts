@@ -884,19 +884,28 @@ function applyPB(st) {
 async function refreshPB() { try { applyPB(await getJSON(BASE + '/api/player')); } catch (e) {} }
 
 // Move within the already-PLAYING playlist (next/prev), leaving the view alone.
-async function playPBIndex(index) { applyPB(await getJSON(BASE + '/api/player/index?index=' + index)); }
+// loadAndPlay swaps the src + play synchronously — essential on iOS, where a track
+// ending in the background can't wait on a server round-trip before playing the
+// next one (Safari blocks .play() on a new src after an await). So advance locally
+// first, then sync server state in the background without retriggering a reload.
+function playLocal(ti) {
+  loadAndPlay(ti);
+  getJSON(BASE + '/api/player/index?index=' + ti)
+    .then((st) => { seenSerial = st.serial; seenPlay = st.playSerial; pb = st; })
+    .catch(() => {});
+}
 function next() {
   if (!pb.tracks.length) return;
   const lp = order.indexOf(curTI);
-  if (lp < order.length - 1) playPBIndex(order[lp + 1]);
-  else if (repeat) playPBIndex(order[0]);
+  if (lp < order.length - 1) playLocal(order[lp + 1]);
+  else if (repeat) playLocal(order[0]);
   else audio.pause();
 }
 function prev() {
   if (!pb.tracks.length) return;
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
   const lp = order.indexOf(curTI);
-  if (lp > 0) playPBIndex(order[lp - 1]);
+  if (lp > 0) playLocal(order[lp - 1]);
   else audio.currentTime = 0;
 }
 
